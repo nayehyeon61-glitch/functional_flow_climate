@@ -82,9 +82,17 @@ def main(argv=None):
 
     if a.pgflow_ens is not None:
         src = E.read_members(a.pgflow_ens, a.pgflow_lead, mean, std)
-        ics = [int(i) for i in src["ic_index"]]
+        # the members at lead L are valid L hours after the file's ICs: the rollout, its tisr forcing, the time
+        # features and the written initial_condition / init_time all start at that valid time
+        shift = int(round(src["lead_hours"] / 6.0))
+        ics = [int(i) + shift for i in src["ic_index"]]
         members0 = src["members"].to(dev)  # (N, M, 66, H, W)
-        label = f"pg-flow members (lead {src['lead_hours']:g} h)"
+        if steps > 0:
+            ok = [k for k, i in enumerate(ics) if i + steps < len(x_year)]
+            if len(ok) < len(ics):
+                print(f"dropping {len(ics) - len(ok)} ICs whose {a.max_lead_hours:g} h rollout runs past the year", flush=True)
+                ics, members0 = [ics[k] for k in ok], members0[ok]
+        label = f"pg-flow members at lead {src['lead_hours']:g} h (ICs shifted by {shift} steps to that valid time)"
     else:
         ics = [i for i in range(0, len(x_year) - steps, a.stride) if int(times[i].astype("datetime64[h]").astype(int) % 24) == 0]
         if a.n_ic:
