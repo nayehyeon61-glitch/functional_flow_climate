@@ -31,42 +31,62 @@ from pgcfm.eval.wb2 import from_kai_forecast_nc  # noqa: E402
 DYN = contract.DYNAMIC_CHANNELS
 
 
-def write_forecast(path: str, forecast: np.ndarray, ic_index: Sequence[int], lead_hours: Sequence[float],
-                   lat: np.ndarray, lon: np.ndarray, init_times: Optional[np.ndarray] = None,
-                   title: str = "functional_flow_climate dynamics field") -> str:
-    """forecast (N, L, [M], 67, H, W) in physical units -> pg-flow / KAI ``forecast.nc``."""
-    has_m = forecast.ndim == 6
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with nc.Dataset(path + ".tmp", "w", format="NETCDF4") as ds:
-        ds.createDimension("initial_condition", forecast.shape[0])
-        ds.createDimension("lead_time", forecast.shape[1])
-        if has_m:
-            ds.createDimension("member", forecast.shape[2])
+class ForecastWriter:
+    """Incremental writer of a pg-flow / KAI ``forecast.nc``: the file is created with its final shape and ICs
+    are written chunk by chunk (``write``), so a long ensemble rollout never holds the whole array in memory."""
+
+    def __init__(self, path: str, n_ic: int, lead_hours: Sequence[float], n_members: Optional[int], lat: np.ndarray,
+                 lon: np.ndarray, title: str = "functional_flow_climate dynamics field"):
+        self.path, self.has_m = path, n_members is not None
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        ds = nc.Dataset(path + ".tmp", "w", format="NETCDF4")
+        ds.createDimension("initial_condition", n_ic)
+        ds.createDimension("lead_time", len(lead_hours))
+        if self.has_m:
+            ds.createDimension("member", n_members)
         ds.createDimension("channel", contract.N_CHANNELS)
-        ds.createDimension("latitude", forecast.shape[-2])
-        ds.createDimension("longitude", forecast.shape[-1])
-        dims = ("initial_condition", "lead_time") + (("member",) if has_m else ()) + ("channel", "latitude", "longitude")
-        v = ds.createVariable("forecast", "f4", dims, zlib=True, complevel=1, shuffle=True)
-        v[:] = forecast.astype(np.float32)
-        v.units = "physical (pgcfm.contract.UNITS per channel)"
-        ds.createVariable("initial_condition", "i8", ("initial_condition",))[:] = np.asarray(ic_index, dtype=np.int64)
+        ds.createDimension("latitude", len(lat))
+        ds.createDimension("longitude", len(lon))
+        dims = ("initial_condition", "lead_time") + (("member",) if self.has_m else ()) + ("channel", "latitude", "longitude")
+        chunks = (1, 1) + ((1,) if self.has_m else ()) + (contract.N_CHANNELS, len(lat), len(lon))
+        self.v = ds.createVariable("forecast", "f4", dims, zlib=True, complevel=1, shuffle=True, chunksizes=chunks)
+        self.v.units = "physical (pgcfm.contract.UNITS per channel)"
+        self.ic = ds.createVariable("initial_condition", "i8", ("initial_condition",))
         lt = ds.createVariable("lead_time", "f8", ("lead_time",))
         lt[:] = np.asarray(lead_hours, dtype=np.float64)
         lt.units = "hours"
-        if has_m:
-            ds.createVariable("member", "i4", ("member",))[:] = np.arange(forecast.shape[2])
+        if self.has_m:
+            ds.createVariable("member", "i4", ("member",))[:] = np.arange(n_members)
         ch = ds.createVariable("channel", str, ("channel",))
         for i, n in enumerate(contract.CHANNEL_NAMES):
             ch[i] = n
         ds.createVariable("latitude", "f8", ("latitude",))[:] = lat
         ds.createVariable("longitude", "f8", ("longitude",))[:] = lon
-        if init_times is not None:
-            it = ds.createVariable("init_time", "i8", ("initial_condition",))
-            it[:] = (np.asarray(init_times, dtype="datetime64[ns]") - np.datetime64("1970-01-01")) // np.timedelta64(1, "h")
-            it.units = "hours since 1970-01-01"
+        self.it = ds.createVariable("init_time", "i8", ("initial_condition",))
+        self.it.units = "hours since 1970-01-01"
         ds.title = title
-    os.replace(path + ".tmp", path)
-    return path
+        self.ds = ds
+
+    def write(self, sl: slice, forecast: np.ndarray, ic_index: Sequence[int], init_times: Optional[np.ndarray] = None):
+        """forecast (n, L, [M], 67, H, W) physical for the ICs ``sl`` of the file."""
+        self.v[sl] = forecast.astype(np.float32)
+        self.ic[sl] = np.asarray(ic_index, dtype=np.int64)
+        if init_times is not None:
+            self.it[sl] = (np.asarray(init_times, dtype="datetime64[ns]") - np.datetime64("1970-01-01")) // np.timedelta64(1, "h")
+
+    def close(self) -> str:
+        self.ds.close()
+        os.replace(self.path + ".tmp", self.path)
+        return self.path
+
+
+def write_forecast(path: str, forecast: np.ndarray, ic_index: Sequence[int], lead_hours: Sequence[float],
+                   lat: np.ndarray, lon: np.ndarray, init_times: Optional[np.ndarray] = None,
+                   title: str = "functional_flow_climate dynamics field") -> str:
+    """forecast (N, L, [M], 67, H, W) in physical units -> pg-flow / KAI ``forecast.nc`` (one shot)."""
+    w = ForecastWriter(path, forecast.shape[0], lead_hours, forecast.shape[2] if forecast.ndim == 6 else None, lat, lon, title)
+    w.write(slice(0, forecast.shape[0]), forecast, ic_index, init_times)
+    return w.close()
 
 
 def read_forecast(path: str) -> Dict[str, np.ndarray]:
