@@ -58,7 +58,16 @@ def truth_from_kai(kai: str, year: int, ic_index: Sequence[int], lead_hours: Seq
                                        only_use_cftime_datetimes=False, only_use_python_datetimes=True),
                            dtype="datetime64[ns]")
         steps = [int(round(h / step_hours)) for h in lead_hours]
-        out = np.stack([np.stack([np.asarray(fields[i + s], dtype=np.float32) for s in steps]) for i in ic_index])
+        # One pass over the needed time slab in 64-step reads, then gather in memory: reading the 1800 single time
+        # steps of a 72 IC x 25 lead truth one by one decompresses a chunk per read and took longer than scoring.
+        lo = int(min(ic_index)) + min(steps)
+        hi = int(max(ic_index)) + max(steps) + 1
+        buf = np.empty((hi - lo,) + fields.shape[1:], dtype=np.float32)
+        for i0 in range(lo, hi, 64):
+            i1 = min(i0 + 64, hi)
+            buf[i0 - lo:i1 - lo] = fields[i0:i1]
+        out = buf[np.array([[int(i) + s - lo for s in steps] for i in ic_index])]
+        del buf
     return to_dataset(out, times[list(ic_index)], lead_hours, lat, lon, member_axis=False)
 
 
