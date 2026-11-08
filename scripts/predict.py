@@ -5,6 +5,9 @@ a pg-flow / KAI ``forecast.nc`` (initial_condition, lead_time, [member], channel
     deterministic   python scripts/predict.py --kai data/era5_5p625/kai6h --run runs/step1 --tag sfno --year 2017
     scenarios       --members 8 --alpha 1.0      perturbed-IC stand-in members (ffc.ensemble.perturbed_members)
     pg-flow input   --pgflow-ens path/to/ensemble.nc --pgflow-lead 0   members of a pg-flow file as the ICs
+    Step 2 FM       --members 8 --flow-run runs/step2 --flow-tag fm_ot_matched --kappa 2.0 [--kappa-s 0.5]
+                    scenarios from the flow-matching generator (ffc.flow) in front of the frozen field;
+                    --kappa-s > 0 also adds a fresh flow error sample after every 6 h step (stochastic dynamics)
 
 Initial conditions: every ``--stride`` 6 h steps of the year at 00 UTC, ``--n-ic`` of them at most; leads 6 h ...
 ``--max-lead-hours``; lead 0 (the IC) is written first as pg-flow does. tisr along the rollout is the known
@@ -25,6 +28,7 @@ import ffc  # noqa: E402,F401
 from ffc import data as D  # noqa: E402
 from ffc import ensemble as E  # noqa: E402
 from ffc.field import DynamicsField, FieldConfig  # noqa: E402
+from ffc import flow as F  # noqa: E402
 from pgcfm import contract  # noqa: E402
 from pgcfm.cfm import TISR_DYN  # noqa: E402
 from pgcfm.data import assemble_full_state  # noqa: E402
@@ -46,6 +50,18 @@ def load_model(run: str, tag: str, kai: str, year: int, dev):
     return model, info, mean, std, lat, lon
 
 
+def load_flow(run: str, tag: str, field, dev):
+    """Step 2 generator trained by scripts/train_flow.py on the errors of ``field``."""
+    info = json.load(open(os.path.join(run, f"{tag}.json")))
+    st = torch.load(os.path.join(run, f"error_stats_{info['field_tag']}.pt"))
+    lat = None  # unused by ErrorFlow beyond the grid shape
+    flow = F.ErrorFlow(F.FlowConfig(**info["cfg"]), field.static.cpu(), st["sigma_e"], st["spectrum"], lat,
+                       field.static.shape[-1]).to(dev)
+    flow.load_state_dict(torch.load(os.path.join(run, f"{tag}.pt"), map_location=dev))
+    flow.eval()
+    return flow, info
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kai", required=True)
@@ -59,6 +75,10 @@ def main(argv=None):
     p.add_argument("--alpha", type=float, default=1.0, help="perturbation size in 6 h increments")
     p.add_argument("--pgflow-ens", default=None, help="pg-flow ensemble forecast.nc whose members are the ICs")
     p.add_argument("--pgflow-lead", type=int, default=0, help="lead index of the pg-flow file to start from")
+    p.add_argument("--flow-run", default=None, help="Step 2 run folder of the flow-matching generator")
+    p.add_argument("--flow-tag", default=None)
+    p.add_argument("--kappa", type=float, default=1.0, help="scenario size in flow error samples")
+    p.add_argument("--kappa-s", type=float, default=0.0, help="stochastic flow error added after every 6 h step")
     p.add_argument("--out", default=None, help="output forecast.nc (default <run>/<tag>_<year>[_mM].nc)")
     p.add_argument("--chunk", type=int, default=4, help="ICs per rollout batch")
     p.add_argument("--threads", type=int, default=4)
@@ -70,7 +90,11 @@ def main(argv=None):
     rng = np.random.default_rng(a.seed)
     model, info, mean, std, lat, lon = load_model(a.run, a.tag, a.kai, a.year, dev)
     train_years = info["args"]["train_years"]
-    data = D.load_years(a.kai, [a.year] + (train_years if a.members > 1 and a.pgflow_ens is None else []), mean, std)
+    flow = None
+    if a.flow_tag:
+        flow, _ = load_flow(a.flow_run, a.flow_tag, model, dev)
+    standin = a.members > 1 and a.pgflow_ens is None and flow is None
+    data = D.load_years(a.kai, [a.year] + (train_years if standin else []), mean, std)
     x_year = data[a.year]
     steps = int(round(a.max_lead_hours / 6.0))
     lead_hours = [0.0] + [6.0 * (k + 1) for k in range(steps)]
@@ -86,21 +110,35 @@ def main(argv=None):
         if a.n_ic:
             ics = ics[: a.n_ic]
         x0 = torch.stack([x_year[i][DYN] for i in ics]).to(dev)
-        members0 = E.perturbed_members(x0, data, train_years, a.members, a.alpha, rng) if a.members > 1 else x0[:, None]
-        label = "ERA5 analysis" if a.members == 1 else f"perturbed-IC stand-in members (alpha {a.alpha:g})"
-    N, M = members0.shape[:2]
+        if flow is not None:
+            members0 = None  # drawn per chunk (needs the operator increment)
+            label = f"flow-matching scenarios {a.flow_tag} (kappa {a.kappa:g}, kappa_s {a.kappa_s:g})"
+        else:
+            members0 = E.perturbed_members(x0, data, train_years, a.members, a.alpha, rng) if a.members > 1 else x0[:, None]
+            label = "ERA5 analysis" if a.members == 1 else f"perturbed-IC stand-in members (alpha {a.alpha:g})"
+    gen = torch.Generator(device=dev).manual_seed(a.seed)
+    if members0 is None:
+        N, M = len(ics), a.members
+    else:
+        N, M = members0.shape[:2]
     out = np.empty((N, len(lead_hours), M, contract.N_CHANNELS, len(lat), len(lon)), dtype=np.float32)
     mean_t, std_t = (torch.as_tensor(q, dtype=torch.float32, device=dev).view(1, 1, -1, 1, 1) for q in (mean, std))
     with torch.no_grad():
         for c in range(0, N, a.chunk):
             sl = slice(c, min(N, c + a.chunk))
             idx = ics[sl]
-            x0 = members0[sl]
             seq = torch.stack([x_year[i:i + steps + 1] for i in idx]).to(dev)  # (b, steps+1, 67, H, W) truth
             tisr = seq[:, 1:, contract.CHANNEL_INDEX["tisr"]]
             orog = seq[:, 0, contract.STATIC_CHANNELS]
             hour0 = torch.tensor([6.0 * i for i in idx], device=dev)
-            y = model.rollout_members(x0, hour0, steps, tisr)  # (b, M, steps, 66, H, W)
+            if members0 is None:
+                x0 = F.flow_members(flow, model, seq[:, 0, DYN], hour0, M, a.kappa, gen)
+            else:
+                x0 = members0[sl]
+            if flow is not None and a.kappa_s > 0:
+                y = F.rollout_stochastic(flow, model, x0, hour0, steps, a.kappa_s, tisr, gen)
+            else:
+                y = model.rollout_members(x0, hour0, steps, tisr)  # (b, M, steps, 66, H, W)
             full0 = assemble_full_state(x0, orog[:, None].expand(-1, M, -1, -1, -1))
             fully = assemble_full_state(y, orog[:, None, None].expand(-1, M, steps, -1, -1, -1))
             allx = torch.cat([full0[:, :, None], fully], 2)  # (b, M, L, 67, H, W)
