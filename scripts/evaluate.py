@@ -70,7 +70,7 @@ def main(argv=None):
                 frames.append(pd.read_csv(pers_csv))
             n_ic = n_ic or len(E.read_forecast_index(path))
             continue
-        f = E.read_forecast(path)
+        f = EV.read_headline(path)
         n_ic = n_ic or len(f["ic_index"])
         init = EV.init_times_of(a.kai, a.year, f["ic_index"])
         truth = EV.truth_from_kai(a.kai, a.year, f["ic_index"], f["lead"], lat, lon)

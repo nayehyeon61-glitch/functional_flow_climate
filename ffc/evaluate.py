@@ -159,6 +159,27 @@ def headline_channels():
     return out
 
 
+def read_headline(path: str) -> Dict:
+    """A forecast.nc reduced to its headline channels while reading (netCDF slicing on the channel axis), so a
+    6 GB 8-member file costs 0.6 GB of memory. Same keys as ``ffc.ensemble.read_forecast``; ``forecast`` has the
+    channels of ``headline_channels()`` in that order."""
+    idx = [c for _, c in headline_channels()]
+    with nc.Dataset(path) as ds:
+        v = ds["forecast"]
+        has_m = "member" in v.dimensions
+        c_axis = v.dimensions.index("channel")
+        parts = []
+        for n in range(v.shape[0]):  # one IC at a time keeps the HDF5 read buffer small
+            sl = [n] + [slice(None)] * (len(v.dimensions) - 1)
+            parts.append(np.stack([np.asarray(v[tuple(sl[:c_axis] + [c] + sl[c_axis + 1:])], dtype=np.float32)
+                                   for c in idx], axis=c_axis - 1))
+        lead = np.asarray(ds["lead_time"][:], dtype=np.float64)
+        if getattr(ds["lead_time"], "units", "hours").startswith("day"):
+            lead = lead * 24.0
+        return {"forecast": np.stack(parts), "ic_index": np.asarray(ds["initial_condition"][:]), "lead": lead,
+                "has_members": has_m, "headline_only": True}
+
+
 def headline_dataset(x: np.ndarray, init_times, lead_hours, lat, lon, member_axis: bool) -> xr.Dataset:
     """(N, L, [M], 67, H, W) -> flat WB2 dataset of the headline variables only (what ``select_headline`` yields),
     built from a channel subset so a large ensemble file never exists as a 67-channel xarray."""
@@ -169,8 +190,10 @@ def headline_dataset(x: np.ndarray, init_times, lead_hours, lat, lon, member_axi
     if member_axis:
         coords[REALIZATION] = np.arange(x.shape[2])
     c_axis = 3 if member_axis else 2
-    ds = xr.Dataset({lab: (dims, np.ascontiguousarray(np.take(x, c, axis=c_axis))) for lab, c in headline_channels()},
-                    coords=coords)
+    hl = headline_channels()
+    if x.shape[c_axis] == len(hl):  # already reduced by read_headline
+        hl = [(lab, k) for k, (lab, _) in enumerate(hl)]
+    ds = xr.Dataset({lab: (dims, np.ascontiguousarray(np.take(x, c, axis=c_axis))) for lab, c in hl}, coords=coords)
     return ds.assign_coords(valid_time=ds.init_time + ds[LEAD])
 
 

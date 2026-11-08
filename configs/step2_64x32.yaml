@@ -1,0 +1,19 @@
+# Step 2 on WeatherBench2 ERA5 64x32 (5.625 deg, 6 h), CPU-sized: flow-matching ensemble generator -> frozen Step 1 field.
+# End to end: KAI=... STEP1=... OUT=... bash scripts/run_step2.sh
+data:
+  kai: data/era5_5p625/kai6h
+  train_years: [2010, 2011, 2012, 2013, 2014, 2015]
+  val_year: 2016          # scenario sizes are fitted here, never on the test year
+  test_year: 2017
+frozen_field: sfno_h1_pinn  # Step 1 (stage 1): dynamics + physics; requires_grad off in stage 2
+flows:                     # stage 2: scripts/train_flow.py (4000 it x batch 16, AdamW 3e-4 cosine, ~48 min on 2 threads)
+  fm_ot_matched:  "--coupling ot --source matched"    # proposed: minibatch OT in H^s + spherical GRF with the errors' spectrum
+  fm_indep_white: "--coupling indep --source white"   # control: plain CFM (pg-flow step 2 style)
+calibration:               # scripts/calibrate_ensemble.py, 16 ICs of 2016, 8 members, fair CRPS of z500/t850/t2m/u850 at 24/72/144 h
+  standin_sfno:    {sizes: [0.5, 1, 2, 4, 8], chosen: 4}
+  standin_climode: {sizes: [0.5, 1, 2, 4], chosen: 2}
+  fm_ot_matched:   {sizes: [1, 2, 4, 8, 16], chosen: 4}
+  fm_indep_white:  {sizes: [1, 2, 4, 8, 16], chosen: 2}
+  fm_ot_stochastic: {kappa: [2, 4], kappa_s: [0.25, 0.5, 1, 2], chosen: {kappa: 2, kappa_s: 0.5}}
+predict: "--year 2017 --stride 20 --max-lead-hours 144 --members 8"   # 72 ICs at 00 UTC, every 5 days, 6 .. 144 h
+evaluate: "--clim-years 2010-2015 --leads 24,72,144"
