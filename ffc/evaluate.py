@@ -126,6 +126,43 @@ def score_files(forecasts: Dict[str, xr.Dataset], truth: xr.Dataset, climatology
     return _to_frame(out)
 
 
+def headline_channels():
+    """[(label, KAI channel index)] of the headline variables (z500, t850, q700, u850, v850, t2m, msl) present in
+    the 67-channel contract."""
+    out = []
+    for var, level in HEADLINE:
+        short = {v: k for k, v in WB2_NAMES.items()}[var]
+        if level is None:
+            if short in contract.CHANNEL_INDEX:
+                out.append((headline_label(var, level), contract.CHANNEL_INDEX[short]))
+        elif level in contract.LEVELS_HPA:
+            out.append((headline_label(var, level), contract.level_slice(short).start + contract.LEVELS_HPA.index(level)))
+    return out
+
+
+def headline_dataset(x: np.ndarray, init_times, lead_hours, lat, lon, member_axis: bool) -> xr.Dataset:
+    """(N, L, [M], 67, H, W) -> flat WB2 dataset of the headline variables only (what ``select_headline`` yields),
+    built from a channel subset so a large ensemble file never exists as a 67-channel xarray."""
+    init = np.asarray(init_times, dtype="datetime64[ns]")
+    lead = (np.asarray(lead_hours, dtype=np.float64) * 3600e9).astype("timedelta64[ns]")
+    dims = ["init_time", LEAD] + ([REALIZATION] if member_axis else []) + ["latitude", "longitude"]
+    coords = {"init_time": init, LEAD: lead, "latitude": np.asarray(lat), "longitude": np.asarray(lon)}
+    if member_axis:
+        coords[REALIZATION] = np.arange(x.shape[2])
+    c_axis = 3 if member_axis else 2
+    ds = xr.Dataset({lab: (dims, np.ascontiguousarray(np.take(x, c, axis=c_axis))) for lab, c in headline_channels()},
+                    coords=coords)
+    return ds.assign_coords(valid_time=ds.init_time + ds[LEAD])
+
+
+def score_one(name: str, ds_headline: xr.Dataset, truth: xr.Dataset, climatology: Optional[xr.Dataset] = None,
+              regions: Sequence[str] = ("global",)) -> pd.DataFrame:
+    """Score one model given as a headline dataset (``headline_dataset``) with pg-flow's ``score_forecast``."""
+    clim_h = select_headline(climatology) if climatology is not None else None
+    sc = wb2_scores.score_forecast(ds_headline, select_headline(truth), climatology=clim_h, region_names=list(regions))
+    return _to_frame({name: sc})
+
+
 def _to_frame(scores: Dict[str, xr.Dataset]) -> pd.DataFrame:
     rows = []
     for model, ds in scores.items():

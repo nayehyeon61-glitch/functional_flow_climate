@@ -14,6 +14,7 @@ import os
 import sys
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,19 +45,11 @@ def main(argv=None):
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     lat, lon = D.grid_of(a.kai, a.year)
-    forecasts, ref = {}, None
-    for spec in a.forecast:
-        name, path = spec.split("=", 1)
-        f = E.read_forecast(path)
-        init = EV.init_times_of(a.kai, a.year, f["ic_index"])
-        forecasts[name] = EV.to_dataset(f["forecast"], init, f["lead"], lat, lon, member_axis=f["has_members"])
-        if ref is None:
-            ref = f
+    # read the IC list of the first file for the truth, then score one file at a time (a 73 x 25 x 8-member
+    # file is 2 GB at 64x32: only its headline channels are kept, and it is freed before the next one)
+    ref = E.read_forecast(a.forecast[0].split("=", 1)[1])
+    ref = {"ic_index": ref["ic_index"], "lead": ref["lead"]}
     truth = EV.truth_from_kai(a.kai, a.year, ref["ic_index"], ref["lead"], lat, lon)
-    if not a.no_persistence:
-        pers = truth.isel(prediction_timedelta=0, drop=True).expand_dims(prediction_timedelta=truth.prediction_timedelta).transpose(
-            "init_time", "prediction_timedelta", ...)
-        forecasts["persistence"] = pers.assign_coords(valid_time=truth.valid_time)
     clim = None
     if a.clim_years:
         clim_path = os.path.join(a.out, f"climatology_{a.clim_years}.nc")
@@ -65,7 +58,24 @@ def main(argv=None):
         else:
             clim = EV.climatology_from_kai(a.kai, _years(a.clim_years), lat, lon)
             clim.to_netcdf(clim_path)
-    df = EV.score_files(forecasts, truth, climatology=clim)
+    frames = []
+    for spec in a.forecast:
+        name, path = spec.split("=", 1)
+        f = E.read_forecast(path)
+        if not (np.array_equal(f["ic_index"], ref["ic_index"]) and np.allclose(f["lead"], ref["lead"])):
+            raise ValueError(f"{path}: initial conditions / leads differ from {a.forecast[0]}")
+        init = EV.init_times_of(a.kai, a.year, f["ic_index"])
+        ds = EV.headline_dataset(f["forecast"], init, f["lead"], lat, lon, member_axis=f["has_members"])
+        del f
+        frames.append(EV.score_one(name, ds, truth, clim))
+        del ds
+        print(f"scored {name}", flush=True)
+    if not a.no_persistence:
+        pers = truth.isel(prediction_timedelta=0, drop=True).expand_dims(prediction_timedelta=truth.prediction_timedelta).transpose(
+            "init_time", "prediction_timedelta", ...)
+        pers = pers.assign_coords(valid_time=truth.valid_time)
+        frames.append(EV.score_one("persistence", EV.select_headline(pers), truth, clim))
+    df = pd.concat(frames, ignore_index=True)
     df.to_csv(os.path.join(a.out, "scores.csv"), index=False)
     leads = [float(x) for x in a.leads.split(",")]
     variables = a.variables.split(",")
