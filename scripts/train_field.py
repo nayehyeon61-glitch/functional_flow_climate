@@ -163,7 +163,9 @@ def main(argv=None):
             step["it"] = torch.load(ck + ".train", weights_only=False)["it"]
 
         def cur_K():
-            return a.curriculum[min(len(a.curriculum) - 1, step["it"] * len(a.curriculum) // a.iters)]
+            # clamped to the sampled window a.K: batches carry a.K future states, so a curriculum stage above it
+            # (e.g. --K 4 with the default 1 2 4 8) would index past the gathered tisr frames
+            return min(a.K, a.curriculum[min(len(a.curriculum) - 1, step["it"] * len(a.curriculum) // a.iters)])
 
         def after_step():
             step["it"] += 1

@@ -71,6 +71,7 @@ def main(argv=None):
     p.add_argument("--stride", type=int, default=20, help="6 h steps between ICs (20 = 5 days)")
     p.add_argument("--n-ic", type=int, default=0, help="0 = all")
     p.add_argument("--max-lead-hours", type=float, default=144.0)
+    p.add_argument("--lead-every-hours", type=float, default=6.0, help="leads kept in the file (rollout stays 6 h)")
     p.add_argument("--members", type=int, default=1)
     p.add_argument("--alpha", type=float, default=1.0, help="perturbation size in 6 h increments")
     p.add_argument("--pgflow-ens", default=None, help="pg-flow ensemble forecast.nc whose members are the ICs")
@@ -81,6 +82,7 @@ def main(argv=None):
     p.add_argument("--kappa-s", type=float, default=0.0, help="stochastic flow error added after every 6 h step")
     p.add_argument("--out", default=None, help="output forecast.nc (default <run>/<tag>_<year>[_mM].nc)")
     p.add_argument("--chunk", type=int, default=4, help="ICs per rollout batch")
+    p.add_argument("--cache", default=None, help="memory-mapped normalized years of the training run (pgcfm.runs.load_years)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto")
@@ -94,17 +96,26 @@ def main(argv=None):
     if a.flow_tag:
         flow, _ = load_flow(a.flow_run, a.flow_tag, model, dev)
     standin = a.members > 1 and a.pgflow_ens is None and flow is None
-    data = D.load_years(a.kai, [a.year] + (train_years if standin else []), mean, std)
+    data = D.load_years(a.kai, [a.year] + (train_years if standin else []), mean, std, cache=a.cache)
     x_year = data[a.year]
     steps = int(round(a.max_lead_hours / 6.0))
-    lead_hours = [0.0] + [6.0 * (k + 1) for k in range(steps)]
+    keep = [k for k in range(steps) if (6.0 * (k + 1)) % a.lead_every_hours == 0]  # rollout steps written
+    lead_hours = [0.0] + [6.0 * (k + 1) for k in keep]
     times = D.times_of(a.kai, a.year)
 
     if a.pgflow_ens is not None:
         src = E.read_members(a.pgflow_ens, a.pgflow_lead, mean, std)
-        ics = [int(i) for i in src["ic_index"]]
+        # the members at lead L are valid L hours after the file's ICs: the rollout, its tisr forcing, the time
+        # features and the written initial_condition / init_time all start at that valid time
+        shift = int(round(src["lead_hours"] / 6.0))
+        ics = [int(i) + shift for i in src["ic_index"]]
         members0 = src["members"].to(dev)  # (N, M, 66, H, W)
-        label = f"pg-flow members (lead {src['lead_hours']:g} h)"
+        if steps > 0:
+            ok = [k for k, i in enumerate(ics) if i + steps < len(x_year)]
+            if len(ok) < len(ics):
+                print(f"dropping {len(ics) - len(ok)} ICs whose {a.max_lead_hours:g} h rollout runs past the year", flush=True)
+                ics, members0 = [ics[k] for k in ok], members0[ok]
+        label = f"pg-flow members at lead {src['lead_hours']:g} h (ICs shifted by {shift} steps to that valid time)"
     else:
         ics = [i for i in range(0, len(x_year) - steps, a.stride) if int(times[i].astype("datetime64[h]").astype(int) % 24) == 0]
         if a.n_ic:
@@ -121,8 +132,11 @@ def main(argv=None):
         N, M = len(ics), a.members
     else:
         N, M = members0.shape[:2]
-    out = np.empty((N, len(lead_hours), M, contract.N_CHANNELS, len(lat), len(lon)), dtype=np.float32)
+    path = a.out or os.path.join(a.run, f"{a.tag}_{a.year}" + (f"_m{M}" if M > 1 else "") + ".nc")
+    writer = E.ForecastWriter(path, N, lead_hours, M if M > 1 else None, lat, lon,
+                              title=f"ffc dynamics field {a.tag}; ICs: {label}")
     mean_t, std_t = (torch.as_tensor(q, dtype=torch.float32, device=dev).view(1, 1, -1, 1, 1) for q in (mean, std))
+    keep_t = torch.tensor(keep, device=dev)
     with torch.no_grad():
         for c in range(0, N, a.chunk):
             sl = slice(c, min(N, c + a.chunk))
@@ -136,20 +150,17 @@ def main(argv=None):
             else:
                 x0 = members0[sl]
             if flow is not None and a.kappa_s > 0:
-                y = F.rollout_stochastic(flow, model, x0, hour0, steps, a.kappa_s, tisr, gen)
+                y = F.rollout_stochastic(flow, model, x0, hour0, steps, a.kappa_s, tisr, gen)[:, :, keep_t]
             else:
-                y = model.rollout_members(x0, hour0, steps, tisr)  # (b, M, steps, 66, H, W)
+                y = model.rollout_members(x0, hour0, steps, tisr)[:, :, keep_t]  # (b, M, L-1, 66, H, W)
             full0 = assemble_full_state(x0, orog[:, None].expand(-1, M, -1, -1, -1))
-            fully = assemble_full_state(y, orog[:, None, None].expand(-1, M, steps, -1, -1, -1))
+            fully = assemble_full_state(y, orog[:, None, None].expand(-1, M, len(keep), -1, -1, -1))
             allx = torch.cat([full0[:, :, None], fully], 2)  # (b, M, L, 67, H, W)
-            phys = allx * (std_t + contract.KAI_STD_EPS) + mean_t
-            out[sl] = phys.permute(0, 2, 1, 3, 4, 5).cpu().numpy()
+            phys = (allx * (std_t + contract.KAI_STD_EPS) + mean_t).permute(0, 2, 1, 3, 4, 5).cpu().numpy()
+            writer.write(sl, phys if M > 1 else phys[:, :, 0], idx, times[idx])
+            del y, fully, allx, phys
             print(f"  ICs {sl.start}-{sl.stop} / {N}", flush=True)
-    if M == 1:
-        out = out[:, :, 0]
-    path = a.out or os.path.join(a.run, f"{a.tag}_{a.year}" + (f"_m{M}" if M > 1 else "") + ".nc")
-    E.write_forecast(path, out, ics, lead_hours, lat, lon, init_times=times[ics],
-                     title=f"ffc dynamics field {a.tag}; ICs: {label}")
+    writer.close()
     print(f"wrote {path}: {N} ICs x {len(lead_hours)} leads" + (f" x {M} members" if M > 1 else ""))
 
 

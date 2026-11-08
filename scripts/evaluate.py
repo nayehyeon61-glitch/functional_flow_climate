@@ -10,6 +10,7 @@ spread-skill of the WB2 / NeuralGCM headline variables at 24 / 72 / 144 h), and 
 """
 
 import argparse
+import gc
 import os
 import sys
 
@@ -42,14 +43,10 @@ def main(argv=None):
     p.add_argument("--leads", default="24,72,144", help="lead hours shown in the tables")
     p.add_argument("--variables", default="z500,t850,t2m,q700,u850,msl")
     p.add_argument("--out", required=True)
+    p.add_argument("--rescore", action="store_true", help="recompute models whose scores_<name>.csv already exists")
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     lat, lon = D.grid_of(a.kai, a.year)
-    # read the IC list of the first file for the truth, then score one file at a time (a 73 x 25 x 8-member
-    # file is 2 GB at 64x32: only its headline channels are kept, and it is freed before the next one)
-    ref = E.read_forecast(a.forecast[0].split("=", 1)[1])
-    ref = {"ic_index": ref["ic_index"], "lead": ref["lead"]}
-    truth = EV.truth_from_kai(a.kai, a.year, ref["ic_index"], ref["lead"], lat, lon)
     clim = None
     if a.clim_years:
         clim_path = os.path.join(a.out, f"climatology_{a.clim_years}.nc")
@@ -58,28 +55,47 @@ def main(argv=None):
         else:
             clim = EV.climatology_from_kai(a.kai, _years(a.clim_years), lat, lon)
             clim.to_netcdf(clim_path)
-    frames = []
-    for spec in a.forecast:
+            print(f"climatology {a.clim_years} -> {clim_path}", flush=True)
+    # One forecast file at a time (each is read against its own ICs and leads, the truth is rebuilt for it), the
+    # scores of every model cached in scores_<name>.csv: a run that stops can be resumed, and memory stays at
+    # one forecast + one truth instead of all models at once.
+    frames, n_ic = [], None
+    for k, spec in enumerate(a.forecast):
         name, path = spec.split("=", 1)
+        csv = os.path.join(a.out, f"scores_{name}.csv")
+        pers_csv = os.path.join(a.out, "scores_persistence.csv")
+        if os.path.exists(csv) and not a.rescore and (k > 0 or a.no_persistence or os.path.exists(pers_csv)):
+            frames.append(pd.read_csv(csv))
+            if k == 0 and not a.no_persistence:
+                frames.append(pd.read_csv(pers_csv))
+            n_ic = n_ic or len(E.read_forecast_index(path))
+            continue
         f = E.read_forecast(path)
-        if not (np.array_equal(f["ic_index"], ref["ic_index"]) and np.allclose(f["lead"], ref["lead"])):
-            raise ValueError(f"{path}: initial conditions / leads differ from {a.forecast[0]}")
+        n_ic = n_ic or len(f["ic_index"])
         init = EV.init_times_of(a.kai, a.year, f["ic_index"])
+        truth = EV.truth_from_kai(a.kai, a.year, f["ic_index"], f["lead"], lat, lon)
+        # headline channels only: a 73 x 25 x 8-member file is 2 GB at 64x32, its 7 headline channels 0.2 GB
         ds = EV.headline_dataset(f["forecast"], init, f["lead"], lat, lon, member_axis=f["has_members"])
         del f
-        frames.append(EV.score_one(name, ds, truth, clim))
+        df = EV.score_one(name, ds, truth, climatology=clim)
+        df.to_csv(csv, index=False)
+        frames.append(df)
         del ds
+        if k == 0 and not a.no_persistence:
+            pers = truth.isel(prediction_timedelta=0, drop=True).expand_dims(prediction_timedelta=truth.prediction_timedelta)
+            pers = pers.transpose("init_time", "prediction_timedelta", ...).assign_coords(valid_time=truth.valid_time)
+            dfp = EV.score_files({"persistence": pers}, truth, climatology=clim)
+            dfp.to_csv(pers_csv, index=False)
+            frames.append(dfp)
+            del pers
+        del truth
+        gc.collect()
         print(f"scored {name}", flush=True)
-    if not a.no_persistence:
-        pers = truth.isel(prediction_timedelta=0, drop=True).expand_dims(prediction_timedelta=truth.prediction_timedelta).transpose(
-            "init_time", "prediction_timedelta", ...)
-        pers = pers.assign_coords(valid_time=truth.valid_time)
-        frames.append(EV.score_one("persistence", EV.select_headline(pers), truth, clim))
     df = pd.concat(frames, ignore_index=True)
     df.to_csv(os.path.join(a.out, "scores.csv"), index=False)
     leads = [float(x) for x in a.leads.split(",")]
     variables = a.variables.split(",")
-    lines = [f"# WeatherBench2 scores, {a.year}, {len(ref['ic_index'])} ICs, grid {len(lat)}x{len(lon)}", ""]
+    lines = [f"# WeatherBench2 scores, {a.year}, {n_ic} ICs (first file), grid {len(lat)}x{len(lon)}", ""]
     for metric, title in (("rmse", "RMSE"), ("acc", "ACC"), ("crps", "CRPS (ensemble) / MAE (deterministic)"),
                           ("ssr", "spread / skill (ensembles)"), ("bias", "bias")):
         if metric not in set(df.metric):

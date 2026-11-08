@@ -77,6 +77,7 @@ def main(argv=None):
     p.add_argument("--n-ic", type=int, default=16)
     p.add_argument("--chunk", type=int, default=2)
     p.add_argument("--out", required=True, help="json with the scores of every size and the chosen one")
+    p.add_argument("--cache", default=None, help="memory-mapped normalized years (pgcfm.runs.load_years)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(argv)
@@ -84,7 +85,7 @@ def main(argv=None):
     dev = torch.device("cpu")
     field, info, mean, std, lat, lon = load_model(a.run, a.tag, a.kai, a.year, dev)
     train_years = info["args"]["train_years"]
-    data = D.load_years(a.kai, [a.year] + (train_years if a.generator == "standin" else []), mean, std)
+    data = D.load_years(a.kai, [a.year] + (train_years if a.generator == "standin" else []), mean, std, cache=a.cache)
     xy = data[a.year]
     steps = max(LEADS) // 6
     lead_idx = [h // 6 - 1 for h in LEADS]

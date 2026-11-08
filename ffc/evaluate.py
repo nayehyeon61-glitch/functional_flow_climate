@@ -58,7 +58,16 @@ def truth_from_kai(kai: str, year: int, ic_index: Sequence[int], lead_hours: Seq
                                        only_use_cftime_datetimes=False, only_use_python_datetimes=True),
                            dtype="datetime64[ns]")
         steps = [int(round(h / step_hours)) for h in lead_hours]
-        out = np.stack([np.stack([np.asarray(fields[i + s], dtype=np.float32) for s in steps]) for i in ic_index])
+        # One pass over the needed time slab in 64-step reads, then gather in memory: reading the 1800 single time
+        # steps of a 72 IC x 25 lead truth one by one decompresses a chunk per read and took longer than scoring.
+        lo = int(min(ic_index)) + min(steps)
+        hi = int(max(ic_index)) + max(steps) + 1
+        buf = np.empty((hi - lo,) + fields.shape[1:], dtype=np.float32)
+        for i0 in range(lo, hi, 64):
+            i1 = min(i0 + 64, hi)
+            buf[i0 - lo:i1 - lo] = fields[i0:i1]
+        out = buf[np.array([[int(i) + s - lo for s in steps] for i in ic_index])]
+        del buf
     return to_dataset(out, times[list(ic_index)], lead_hours, lat, lon, member_axis=False)
 
 
@@ -74,34 +83,44 @@ def init_times_of(kai: str, year: int, ic_index: Sequence[int]) -> np.ndarray:
 def climatology_from_kai(kai: str, years: Sequence[int], lat, lon, window_days: int = 15) -> xr.Dataset:
     """(dayofyear, hour, ...) mean of the training years, smoothed over +-window_days (WB2's climatology
     layout for ``metrics.ACC``: it selects by valid_time.dayofyear and valid_time.hour)."""
-    sums, counts = {}, {}
+    # Accumulated in float32 straight into the (dayofyear, hour) array, year file read in chunks, smoothing per
+    # channel: the whole thing stays near one copy of the climatology in memory (the six 64x32 years in float64
+    # with a dict of sums went past the memory of the cloud box).
+    C, H, W = contract.N_CHANNELS, len(lat), len(lon)
+    arr = cnt = hours = None
     for y in years:
         with nc.Dataset(os.path.join(kai, f"{y}.nc")) as d:
             t = d["time"]
             times = pd.DatetimeIndex(nc.num2date(t[:], units=t.units, calendar=getattr(t, "calendar", "standard"),
                                                  only_use_cftime_datetimes=False, only_use_python_datetimes=True))
-            f = np.asarray(d["fields"][:], dtype=np.float64)
-        doy, hour = times.dayofyear.values, times.hour.values
-        for dd, hh in {(a, b) for a, b in zip(doy, hour)}:
-            m = (doy == dd) & (hour == hh)
-            sums[(dd, hh)] = sums.get((dd, hh), 0.0) + f[m].sum(0)
-            counts[(dd, hh)] = counts.get((dd, hh), 0) + int(m.sum())
-    days = sorted({k[0] for k in sums})
-    hours = sorted({k[1] for k in sums})
-    arr = np.full((len(days), len(hours), contract.N_CHANNELS, len(lat), len(lon)), np.nan)
-    for i, dd in enumerate(days):
-        for j, hh in enumerate(hours):
-            if (dd, hh) in sums:
-                arr[i, j] = sums[(dd, hh)] / counts[(dd, hh)]
-    # circular smoothing over the day of year
+            doy, hour = times.dayofyear.values, times.hour.values
+            if hours is None:
+                hours = sorted(set(hour.tolist()))
+                arr = np.zeros((366, len(hours), C, H, W), np.float32)
+                cnt = np.zeros((366, len(hours)), np.int32)
+            hidx = np.array([hours.index(h) for h in hour])
+            fields = d["fields"]
+            for i0 in range(0, len(times), 64):
+                f = np.asarray(fields[i0:i0 + 64], dtype=np.float32)
+                for j in range(f.shape[0]):
+                    arr[doy[i0 + j] - 1, hidx[i0 + j]] += f[j]
+                    cnt[doy[i0 + j] - 1, hidx[i0 + j]] += 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        arr /= np.where(cnt > 0, cnt, np.nan).astype(np.float32)[:, :, None, None, None]
+    # circular nan-aware running mean over the day of year, one channel at a time
     if window_days > 0:
-        k = np.ones(2 * window_days + 1) / (2 * window_days + 1)
-        pad = np.concatenate([arr[-window_days:], arr, arr[:window_days]], 0)
-        sm = np.empty_like(arr)
-        for i in range(len(days)):
-            sm[i] = np.nanmean(pad[i:i + 2 * window_days + 1], 0)
-        arr = sm
-    coords = {"dayofyear": np.array(days), "hour": np.array(hours), "latitude": np.asarray(lat), "longitude": np.asarray(lon),
+        w, L = window_days, 2 * window_days + 1
+        valid = np.isfinite(arr)
+        for c in range(C):
+            a, v = arr[:, :, c], valid[:, :, c]
+            pad = np.concatenate([a[-w:], a, a[:w]], 0)
+            padv = np.concatenate([v[-w:], v, v[:w]], 0)
+            num = np.cumsum(np.concatenate([np.zeros_like(pad[:1]), np.nan_to_num(pad)], 0), 0, dtype=np.float64)
+            den = np.cumsum(np.concatenate([np.zeros_like(padv[:1]), padv], 0), 0, dtype=np.float64)
+            s, n = num[L:] - num[:-L], den[L:] - den[:-L]
+            arr[:, :, c] = np.where(n > 0, s / np.maximum(n, 1), np.nan).astype(np.float32)
+    days = np.arange(1, 367)
+    coords = {"dayofyear": days, "hour": np.array(hours), "latitude": np.asarray(lat), "longitude": np.asarray(lon),
               "level": np.array(contract.LEVELS_HPA)}
     data_vars = {}
     for v in contract.UPPER_AIR_VARS + contract.SURFACE_VARS:

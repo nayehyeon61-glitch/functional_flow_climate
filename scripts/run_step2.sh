@@ -18,14 +18,14 @@ wait
 # 2. scenario size on the validation year 2016 (fair CRPS of z500, t850, t2m, u850 at 24/72/144 h)
 cal() { python scripts/calibrate_ensemble.py --kai "$KAI" --run "$STEP1" --year 2016 --members "$M" --threads "$T" "$@"; }
 best() { python -c "import json,sys; print(json.load(open(sys.argv[1]))['best'])" "$1"; }
-cal --tag "$FIELD" --generator standin --sizes 0.5 1 2 4 --out "$OUT/cal_standin_$FIELD.json"
+cal --tag "$FIELD" --generator standin --sizes 0.5 1 2 4 8 --out "$OUT/cal_standin_$FIELD.json"
 cal --tag climate_ode --generator standin --sizes 0.5 1 2 4 --out "$OUT/cal_standin_climate_ode.json"
 for f in fm_ot_matched fm_indep_white; do
-    cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag $f --sizes 1 2 4 8 --out "$OUT/cal_$f.json"
+    cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag $f --sizes 1 2 4 8 16 --out "$OUT/cal_$f.json"
 done
 K=$(best "$OUT/cal_fm_ot_matched.json")
 cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$K" \
-    --stochastic-sizes 0.25 0.5 1 --out "$OUT/cal_fm_ot_matched_stoch.json"
+    --stochastic-sizes 0.25 0.5 1 2 --out "$OUT/cal_fm_ot_matched_stoch.json"
 
 # 3. test year 2017: 73 ICs (00 UTC, every 5 days), 6 .. 144 h, M members
 P="--kai $KAI --run $STEP1 --year 2017 --stride 20 --max-lead-hours 144 --members $M --threads 4"
