@@ -146,7 +146,7 @@ def main(argv=None):
             orog = seq[:, 0, contract.STATIC_CHANNELS]
             hour0 = torch.tensor([6.0 * i for i in idx], device=dev)
             if members0 is None:
-                x0 = F.flow_members(flow, model, seq[:, 0, DYN], hour0, M, a.kappa, gen)
+                x0 = F.flow_members(flow, model, seq[:, 0, DYN], hour0, M, a.kappa, gen, tisr_next=tisr[:, 0])
             else:
                 x0 = members0[sl]
             if flow is not None and a.kappa_s > 0:

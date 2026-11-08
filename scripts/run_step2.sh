@@ -37,21 +37,25 @@ done
 read KS KS_S < <(python -c "import json,sys; r=[json.load(open(f)) for f in sys.argv[1:]]; \
 b=min(r, key=lambda q: q['scores'][str(q['best'])]['crps_mean']); print(b['kappa'], b['best'])" "$OUT"/cal_fm_ot_matched_stoch_k*.json)
 
-# 3. test year 2017: 73 ICs (00 UTC, every 5 days), 6 .. 144 h, M members
-P="--kai $KAI --run $STEP1 --year 2017 --stride 20 --max-lead-hours 144 --members $M --threads 4 --cache $CACHE"
-python scripts/predict.py $P --tag "$FIELD" --alpha "$(best "$OUT/cal_standin_$FIELD.json")" --out "$OUT/A_standin_sfno.nc"
-python scripts/predict.py $P --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$K" --out "$OUT/B_fm_ot.nc"
-python scripts/predict.py $P --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$KS" \
-    --kappa-s "$KS_S" --out "$OUT/C_fm_ot_stoch.nc"
-python scripts/predict.py $P --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_indep_white \
-    --kappa "$(best "$OUT/cal_fm_indep_white.json")" --out "$OUT/D_fm_indep.nc"
-python scripts/predict.py $P --tag climate_ode --alpha "$(best "$OUT/cal_standin_climate_ode.json")" --out "$OUT/E_standin_climode.nc"
-python scripts/predict.py --kai "$KAI" --run "$STEP1" --year 2017 --stride 20 --max-lead-hours 144 --tag climate_ode --out "$OUT/climode_det.nc"
-python scripts/predict.py --kai "$KAI" --run "$STEP1" --year 2017 --stride 20 --max-lead-hours 144 --tag "$FIELD" --out "$OUT/sfno_det.nc"
-
-# 4. WeatherBench2 scores (+ persistence)
+# 3-4. test year 2017: 72 ICs (00 UTC, every 5 days), 6 .. 144 h, M members, scored with WeatherBench2 one file at a
+# time and deleted after scoring (an 8-member file is 5.9 GB at 64x32); scores_<name>.csv, scores.csv, tables.md
+P="--kai $KAI --run $STEP1 --year 2017 --stride 20 --max-lead-hours 144 --threads 4 --cache $CACHE"
+EV="python scripts/evaluate.py --kai $KAI --year 2017 --clim-years 2010-2015 --leads 24,72,144 --out $OUT/eval_2017"
+first=1
+run() { local name=$1 file=$OUT/$2 keep=$3; shift 3
+    python scripts/predict.py $P "$@" --out "$file"
+    if [ $first = 1 ]; then $EV --forecast "$name=$file"; first=0; else $EV --no-persistence --forecast "$name=$file"; fi
+    [ "$keep" = keep ] || rm -f "$file"
+}
+run SFNO_det sfno_det.nc keep --tag "$FIELD"
+run climateODE_det climode_det.nc keep --tag climate_ode
+run A_standin_SFNO A.nc del --members "$M" --tag "$FIELD" --alpha "$(best "$OUT/cal_standin_$FIELD.json")"
+run B_FM_OT_GRF B.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$K"
+run C_FM_OT_GRF_stoch C.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$KS" --kappa-s "$KS_S"
+run D_FM_indep_white D.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_indep_white \
+    --kappa "$(best "$OUT/cal_fm_indep_white.json")"
+run E_standin_climateODE E.nc del --members "$M" --tag climate_ode --alpha "$(best "$OUT/cal_standin_climate_ode.json")"
 python scripts/evaluate.py --kai "$KAI" --year 2017 --clim-years 2010-2015 --leads 24,72,144 --out "$OUT/eval_2017" \
-    --forecast "A stand-in -> SFNO=$OUT/A_standin_sfno.nc" --forecast "B FM(OT,GRF) -> SFNO=$OUT/B_fm_ot.nc" \
-    --forecast "C FM(OT,GRF) -> SFNO + stoch=$OUT/C_fm_ot_stoch.nc" --forecast "D FM(indep,white) -> SFNO=$OUT/D_fm_indep.nc" \
-    --forecast "E stand-in -> climate ODE=$OUT/E_standin_climode.nc" --forecast "climate ODE (det)=$OUT/climode_det.nc" \
-    --forecast "SFNO (det)=$OUT/sfno_det.nc"
+    --forecast "SFNO_det=$OUT/sfno_det.nc" --forecast "climateODE_det=$OUT/climode_det.nc" \
+    $(for n in A_standin_SFNO B_FM_OT_GRF C_FM_OT_GRF_stoch D_FM_indep_white E_standin_climateODE; do echo "--forecast $n=$OUT/$n.nc"; done)
+python scripts/plot_step2.py --scores "$OUT/eval_2017/scores.csv" --out "$OUT/fig_crps_ssr.png"

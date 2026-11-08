@@ -244,12 +244,14 @@ def operator_increment(field, x0: torch.Tensor, hours: torch.Tensor, tisr_next: 
 
 @torch.no_grad()
 def flow_members(flow: ErrorFlow, field, x0: torch.Tensor, hours: torch.Tensor, M: int, kappa: float,
-                 generator: Optional[torch.Generator] = None, control: bool = True) -> torch.Tensor:
+                 generator: Optional[torch.Generator] = None, control: bool = True,
+                 tisr_next: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(B, 66, H, W) -> (B, M, 66, H, W): x0 + kappa sigma_e z^(m), z^(m) ~ p(z | x0); member 0 is x0 itself when
-    ``control`` (the same convention as the Step 1 stand-in)."""
+    ``control`` (the same convention as the Step 1 stand-in). ``tisr_next`` (B, H, W), the known forcing 6 h later,
+    must be given as in training: the condition's tisr channel is the forcing increment."""
     B = x0.shape[0]
     n_gen = M - 1 if control else M
-    _, inc = operator_increment(field, x0, hours)
+    _, inc = operator_increment(field, x0, hours, tisr_next)
     cond = flow.condition(x0, inc, hours).repeat_interleave(n_gen, 0)
     z = flow.sample(cond, generator).view(B, n_gen, *x0.shape[1:])
     m = x0[:, None] + kappa * flow.error(z.flatten(0, 1)).view_as(z)

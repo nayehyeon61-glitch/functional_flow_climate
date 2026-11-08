@@ -107,7 +107,7 @@ def main(argv=None):
             tisr = seq[:, 1:, contract.CHANNEL_INDEX["tisr"]]
             hour0 = torch.tensor([6.0 * i for i in idx])
             if a.generator == "flow":
-                base = F.flow_members(flow, field, x0, hour0, a.members, 1.0, gen)  # kappa 1: x0 + sigma_e z
+                base = F.flow_members(flow, field, x0, hour0, a.members, 1.0, gen, tisr_next=tisr[:, 0])  # kappa 1: x0 + sigma_e z
                 dz = base - x0[:, None]
             else:
                 base = E.perturbed_members(x0, data, train_years, a.members, 1.0, rng)
