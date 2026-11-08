@@ -1,0 +1,18 @@
+# Step 1 experiment on WeatherBench2 ERA5 64x32 (5.625 deg, 6 h), CPU-sized. Command lines of the four arms
+# (scripts/train_field.py); every arm shares data, solver, loss units and validation, only the field differs.
+data:
+  kai: data/era5_5p625/kai6h          # bash scripts/fetch_era5.sh
+  train_years: [2010, 2011, 2012, 2013, 2014, 2015]
+  val_year: 2016
+  test_year: 2017
+  cache: runs/cache                    # memory-mapped normalized years (pgcfm.runs.load_years)
+common: "--iters 3000 --batch 4 --K 8 --curriculum 1 2 4 8 --lr 3e-4 --val-every 250 --n-val 8 --val-K 8 --solver midpoint --dt-hours 6"
+arms:
+  climate_ode:   "--backbone resnet --width 48 --layers 2"                                        # ClimODE ResNet tendency + ODE solver (pg-flow DynCore)
+  sfno_l2:       "--backbone sfno --width 64 --layers 4 --modes-lat 16"                           # spherical neural operator, L2 rollout loss
+  sfno_h1_pinn:  "--backbone sfno --width 64 --layers 4 --modes-lat 16 --lambda-sob 1 --sob-s 1 --lambda-p 0.05 --phys-target 1"
+  sfno_w2:       "--backbone sfno --width 64 --layers 4 --modes-lat 16 --lambda-sob 1 --sob-s -1"  # H^-1 = W2 tangent norm
+predict: "--year 2017 --stride 20 --max-lead-hours 144"          # 73 ICs at 00 UTC, every 5 days, 6 .. 144 h
+ensemble: "--members 8 --alpha 1.0"                             # perturbed-IC stand-in for pg-flow scenarios
+evaluate: "--clim-years 2010-2015 --leads 24,72,144"
+# GPU / 1.5 deg (KAI 240x121): the same commands with --kai <KAI ERA5 dir> --device cuda --amp --width 128 --modes-lat 48

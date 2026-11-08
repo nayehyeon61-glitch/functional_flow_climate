@@ -1,0 +1,7 @@
+[submodule "third_party/pgflow"]
+	path = third_party/pgflow
+	url = https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
+	branch = claude/blend-sr-s1
+[submodule "third_party/neuraloperator"]
+	path = third_party/neuraloperator
+	url = https://github.com/nayehyeon61-glitch/neuraloperator.git

@@ -1,0 +1,28 @@
+# functional_flow_climate (Step 1). Reference code: git submodules under third_party/
+#   git submodule update --init --depth 1
+# torch: CPU wheel is enough for the 64x32 experiments (pip install torch --index-url https://download.pytorch.org/whl/cpu)
+torch
+torchdiffeq
+torch-harmonics
+tensorly
+tensorly-torch
+opt_einsum
+numpy
+scipy
+pandas
+xarray
+zarr
+gcsfs
+fsspec
+aiohttp
+dask
+netCDF4
+matplotlib
+properscoring
+pytest
+ruamel.yaml
+# pg-flow (third_party/pgflow) imports at module level
+torchcfm==1.0.7        # pip install --no-deps torchcfm==1.0.7 ; plus `pot`
+pot
+torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git
+tqdm
