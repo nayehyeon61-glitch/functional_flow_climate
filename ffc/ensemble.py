@@ -102,6 +102,12 @@ def read_forecast(path: str) -> Dict[str, np.ndarray]:
     return out
 
 
+def read_forecast_index(path: str) -> np.ndarray:
+    """``initial_condition`` of a forecast file without reading the forecast itself."""
+    with nc.Dataset(path) as ds:
+        return np.asarray(ds["initial_condition"][:])
+
+
 def read_members(path: str, lead_index: int, mean: np.ndarray, std: np.ndarray) -> Dict[str, torch.Tensor]:
     """The scenarios of a pg-flow file at one lead as operator input.
 
