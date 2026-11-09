@@ -70,13 +70,14 @@ def main(argv=None):
                 frames.append(pd.read_csv(pers_csv))
             n_ic = n_ic or len(E.read_forecast_index(path))
             continue
-        f = E.read_forecast(path)
+        f = EV.read_headline(path)
         n_ic = n_ic or len(f["ic_index"])
         init = EV.init_times_of(a.kai, a.year, f["ic_index"])
         truth = EV.truth_from_kai(a.kai, a.year, f["ic_index"], f["lead"], lat, lon)
-        ds = EV.to_dataset(f["forecast"], init, f["lead"], lat, lon, member_axis=f["has_members"])
+        # headline channels only: a 73 x 25 x 8-member file is 2 GB at 64x32, its 7 headline channels 0.2 GB
+        ds = EV.headline_dataset(f["forecast"], init, f["lead"], lat, lon, member_axis=f["has_members"])
         del f
-        df = EV.score_files({name: ds}, truth, climatology=clim)
+        df = EV.score_one(name, ds, truth, climatology=clim)
         df.to_csv(csv, index=False)
         frames.append(df)
         del ds

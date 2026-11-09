@@ -145,6 +145,66 @@ def score_files(forecasts: Dict[str, xr.Dataset], truth: xr.Dataset, climatology
     return _to_frame(out)
 
 
+def headline_channels():
+    """[(label, KAI channel index)] of the headline variables (z500, t850, q700, u850, v850, t2m, msl) present in
+    the 67-channel contract."""
+    out = []
+    for var, level in HEADLINE:
+        short = {v: k for k, v in WB2_NAMES.items()}[var]
+        if level is None:
+            if short in contract.CHANNEL_INDEX:
+                out.append((headline_label(var, level), contract.CHANNEL_INDEX[short]))
+        elif level in contract.LEVELS_HPA:
+            out.append((headline_label(var, level), contract.level_slice(short).start + contract.LEVELS_HPA.index(level)))
+    return out
+
+
+def read_headline(path: str) -> Dict:
+    """A forecast.nc reduced to its headline channels while reading (netCDF slicing on the channel axis), so a
+    6 GB 8-member file costs 0.6 GB of memory. Same keys as ``ffc.ensemble.read_forecast``; ``forecast`` has the
+    channels of ``headline_channels()`` in that order."""
+    idx = [c for _, c in headline_channels()]
+    with nc.Dataset(path) as ds:
+        v = ds["forecast"]
+        has_m = "member" in v.dimensions
+        c_axis = v.dimensions.index("channel")
+        parts = []
+        for n in range(v.shape[0]):  # one IC at a time keeps the HDF5 read buffer small
+            sl = [n] + [slice(None)] * (len(v.dimensions) - 1)
+            parts.append(np.stack([np.asarray(v[tuple(sl[:c_axis] + [c] + sl[c_axis + 1:])], dtype=np.float32)
+                                   for c in idx], axis=c_axis - 1))
+        lead = np.asarray(ds["lead_time"][:], dtype=np.float64)
+        if getattr(ds["lead_time"], "units", "hours").startswith("day"):
+            lead = lead * 24.0
+        return {"forecast": np.stack(parts), "ic_index": np.asarray(ds["initial_condition"][:]), "lead": lead,
+                "has_members": has_m, "headline_only": True}
+
+
+def headline_dataset(x: np.ndarray, init_times, lead_hours, lat, lon, member_axis: bool) -> xr.Dataset:
+    """(N, L, [M], 67, H, W) -> flat WB2 dataset of the headline variables only (what ``select_headline`` yields),
+    built from a channel subset so a large ensemble file never exists as a 67-channel xarray."""
+    init = np.asarray(init_times, dtype="datetime64[ns]")
+    lead = (np.asarray(lead_hours, dtype=np.float64) * 3600e9).astype("timedelta64[ns]")
+    dims = ["init_time", LEAD] + ([REALIZATION] if member_axis else []) + ["latitude", "longitude"]
+    coords = {"init_time": init, LEAD: lead, "latitude": np.asarray(lat), "longitude": np.asarray(lon)}
+    if member_axis:
+        coords[REALIZATION] = np.arange(x.shape[2])
+    c_axis = 3 if member_axis else 2
+    hl = headline_channels()
+    if x.shape[c_axis] == len(hl):  # already reduced by read_headline
+        hl = [(lab, k) for k, (lab, _) in enumerate(hl)]
+    ds = xr.Dataset({lab: (dims, np.ascontiguousarray(np.take(x, c, axis=c_axis))) for lab, c in hl}, coords=coords)
+    return ds.assign_coords(valid_time=ds.init_time + ds[LEAD])
+
+
+def score_one(name: str, ds_headline: xr.Dataset, truth: xr.Dataset, climatology: Optional[xr.Dataset] = None,
+              regions: Sequence[str] = ("global",)) -> pd.DataFrame:
+    """Score one model given as a headline dataset (``headline_dataset``) with pg-flow's ``score_forecast``."""
+    clim_h = select_headline(climatology) if climatology is not None else None
+    sc = wb2_scores.score_forecast(ds_headline, select_headline(truth), climatology=clim_h, region_names=list(regions))
+    return _to_frame({name: sc})
+
+
 def _to_frame(scores: Dict[str, xr.Dataset]) -> pd.DataFrame:
     rows = []
     for model, ds in scores.items():
