@@ -27,6 +27,7 @@ Install (no Julia package server needed, only github.com over git and conda-forg
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -70,7 +71,11 @@ class SpeedyCore:
         dyn = contract.DYNAMIC_CHANNELS
         self.mean = np.asarray(mean, np.float64)[dyn]
         self.std = np.asarray(std, np.float64)[dyn]
-        self.tmp = tempfile.mkdtemp(prefix="speedy_", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        # exchange files: /dev/shm when it can hold a full chunk (in + out, 2x margin), else the disk temp dir
+        # (Docker's default /dev/shm is 64 MiB; a 64-state chunk at 18 layers needs ~110 MiB)
+        need = 2 * chunk * 4 * (6 * cfg.layers + 6) * 32 * 64 * 2
+        shm = "/dev/shm" if os.path.isdir("/dev/shm") and shutil.disk_usage("/dev/shm").free > need else None
+        self.tmp = tempfile.mkdtemp(prefix="speedy_", dir=shm)
         julia = os.environ.get("FFC_JULIA", "/opt/mamba/envs/jl/bin/julia")
         project = os.environ.get("FFC_JULIA_PROJECT", "/opt/jsw")
         env = dict(os.environ)
