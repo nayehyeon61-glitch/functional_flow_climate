@@ -59,8 +59,8 @@ class FieldConfig:
     solver: str = "midpoint"     # torchdiffeq fixed-grid method: euler | midpoint | rk4 | heun3
     positive: bool = True        # PositiveMass after every 6 h step
     lat_padding: float = 0.125   # fno: neuraloperator domain padding in latitude (fraction of H)
-    core: str = ""               # "" (pure operator) | "dinosaur" (physics core + operator residual)
-    core_cfg: Optional[dict] = None  # ffc.physcore.CoreConfig fields
+    core: str = ""               # "" (pure operator) | "dinosaur" | "speedy" (physics core + operator residual)
+    core_cfg: Optional[dict] = None  # ffc.physcore.CoreConfig / ffc.speedycore.SpeedyConfig fields
 
 
 def _zero_last_layer(module: nn.Module) -> None:
@@ -116,12 +116,16 @@ class DynamicsField(nn.Module):
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
         self.core = None
         if cfg.core:
-            if cfg.core != "dinosaur":
+            if cfg.core not in ("dinosaur", "speedy"):
                 raise ValueError(f"unknown physics core {cfg.core!r}")
             if orog_si is None:
                 raise ValueError("a physics core needs the surface geopotential orog_si (H, W)")
-            from .physcore import CoreConfig, SpectralCore
-            self.core = SpectralCore(CoreConfig(**(cfg.core_cfg or {})), mean, std, lat_deg, orog_si)
+            if cfg.core == "dinosaur":
+                from .physcore import CoreConfig, SpectralCore
+                self.core = SpectralCore(CoreConfig(**(cfg.core_cfg or {})), mean, std, lat_deg, orog_si)
+            else:   # Step 5: SpeedyWeather.jl PrimitiveWetModel (with its physics) in a Julia worker process
+                from .speedycore import SpeedyConfig, SpeedyCore
+                self.core = SpeedyCore(SpeedyConfig(**(cfg.core_cfg or {})), mean, std, lat_deg, orog_si)
             self.register_buffer("core_alpha", torch.ones(1, N_DYN, 1, 1))
         n_in = N_DYN + static.shape[0] + N_TIME + (N_DYN if self.core is not None else 0)
         self.net = make_backbone(n_in, N_DYN, cfg, static.shape[-2], n_lon)
@@ -131,16 +135,23 @@ class DynamicsField(nn.Module):
         self.cache_core = None  # a list: the core increments of every step are appended (the trainer's PINN term)
 
     # -- the field ---------------------------------------------------------------------------------------
-    def core_increment(self, x: torch.Tensor) -> Optional[torch.Tensor]:
-        """F_phys(x): alpha * the physics core's 6 h increment (normalized), no gradient; None without a core."""
+    def _core_raw(self, x: torch.Tensor, hours: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.cfg.core == "speedy":   # the physics needs the state's time (solar zenith angle)
+            return self.core.increment(x, hours)
+        return self.core.increment(x)
+
+    def core_increment(self, x: torch.Tensor, hours: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """F_phys(x): alpha * the physics core's 6 h increment (normalized), no gradient; None without a core.
+        ``hours`` (B,) since Jan 1 00 UTC is used by cores with time-dependent physics (SpeedyWeather)."""
         if self.core is None:
             return None
-        return self.core.increment(x) * self.core_alpha * self.keep
+        return self._core_raw(x, hours) * self.core_alpha * self.keep
 
     @torch.no_grad()
-    def calibrate_core(self, x0: torch.Tensor, d: torch.Tensor, lat_w: torch.Tensor) -> torch.Tensor:
+    def calibrate_core(self, x0: torch.Tensor, d: torch.Tensor, lat_w: torch.Tensor,
+                       hours: Optional[torch.Tensor] = None) -> torch.Tensor:
         """alpha_c = <D, d>_w / <D, D>_w per channel on ERA5 pairs (x0, d = x(6 h) - x0), clipped to [0, 1]."""
-        raw = self.core.increment(x0)
+        raw = self._core_raw(x0, hours)
         w = lat_w.view(1, 1, -1, 1)
         alpha = ((raw * d * w).sum((0, 2, 3)) / (raw * raw * w).sum((0, 2, 3)).clamp_min(1e-12)).clamp(0.0, 1.0)
         self.core_alpha.copy_(alpha.view(1, -1, 1, 1))
@@ -153,7 +164,7 @@ class DynamicsField(nn.Module):
         parts = [x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
         if self.core is not None:
             if core_inc is None:
-                core_inc = self.core_increment(x)
+                core_inc = self.core_increment(x, hours)
             parts.append(core_inc / self.t6)
         out = self.net(torch.cat(parts, 1)) * self.t6 * self.keep
         return out if core_inc is None else out + core_inc
@@ -163,7 +174,7 @@ class DynamicsField(nn.Module):
         increment is computed once from the step's start state and held fixed over the step."""
         from torchdiffeq import odeint
 
-        ci = self.core_increment(x)
+        ci = self.core_increment(x, hours)
         if ci is not None and self.cache_core is not None:
             self.cache_core.append(ci)
 

@@ -59,11 +59,14 @@ def parse(argv=None):
     p.add_argument("--dt-hours", type=float, default=6.0)
     p.add_argument("--solver", default="midpoint", choices=["euler", "midpoint", "rk4", "heun3"])
     p.add_argument("--no-positive", action="store_true")
-    p.add_argument("--core", default="", choices=["", "dinosaur"], help="physics core under the operator (Step 4)")
+    p.add_argument("--core", default="", choices=["", "dinosaur", "speedy"],
+                   help="physics core under the operator: dinosaur (Step 4) or SpeedyWeather.jl (Step 5)")
     p.add_argument("--core-trunc", type=int, default=21)
     p.add_argument("--core-layers", type=int, default=18)
     p.add_argument("--core-dt-min", type=float, default=30.0)
     p.add_argument("--core-dfi-h", type=float, default=6.0)
+    p.add_argument("--core-physics", default="all",
+                   help="speedy: all | none (adiabatic) | comma list of parameterizations to switch off")
     p.add_argument("--core-calib", type=int, default=64, help="training pairs for the per-channel core weight alpha")
     # loss
     p.add_argument("--K", type=int, default=8, help="training window (6 h steps)")
@@ -103,6 +106,14 @@ def parse(argv=None):
     return a
 
 
+def core_cfg_of(a):
+    if a.core == "dinosaur":
+        return dict(truncation=a.core_trunc, layers=a.core_layers, dt_minutes=a.core_dt_min, dfi_hours=a.core_dfi_h)
+    if a.core == "speedy":
+        return dict(layers=a.core_layers, dt_minutes=a.core_dt_min, physics=a.core_physics)
+    return None
+
+
 def main(argv=None):
     a = parse(argv)
     torch.set_num_threads(a.threads)
@@ -128,20 +139,19 @@ def main(argv=None):
     # -- model -------------------------------------------------------------------------------------------
     cfg = FieldConfig(backbone=a.backbone, width=a.width, n_layers=a.layers, modes_lat=a.modes_lat,
                       modes_lon=a.modes_lon, dt_hours=a.dt_hours, solver=a.solver, positive=not a.no_positive,
-                      core=a.core, core_cfg=dict(truncation=a.core_trunc, layers=a.core_layers, dt_minutes=a.core_dt_min,
-                                                 dfi_hours=a.core_dfi_h) if a.core else None)
+                      core=a.core, core_cfg=core_cfg_of(a))
     model = DynamicsField(cfg, static, t6v, mean, std, lat, W, orog_si=orog_si).to(dev)
     model.grad_ckpt = a.grad_ckpt
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "tag": tag, "grid": [H, W], "n_params": model.n_params(),
            "t6": t6v.tolist(), "run": run_record(dev)}
     if model.core is not None:
         crng = np.random.default_rng(a.seed + 7)
-        cx0, cd, _, _ = D.sample(data, a.train_years, 1, crng, a.core_calib)
+        cx0, cd, _, ch0 = D.sample(data, a.train_years, 1, crng, a.core_calib)
         tc = time.time()
-        alpha = model.calibrate_core(cx0.to(dev), cd[:, 0].to(dev), D.lat_weights(lat, dev))
+        alpha = model.calibrate_core(cx0.to(dev), cd[:, 0].to(dev), D.lat_weights(lat, dev), ch0.to(dev))
         names = [contract.CHANNEL_NAMES[c] for c in DYN]
         res["core"] = {"alpha": dict(zip(names, alpha.tolist())), "seconds_per_state": (time.time() - tc) / a.core_calib}
-        log(f"[core] dinosaur T{a.core_trunc} L{a.core_layers} dt {a.core_dt_min:g} min DFI {a.core_dfi_h:g} h, "
+        log(f"[core] {model.core.config_dict()}, "
             f"{res['core']['seconds_per_state']:.3f} s/state; alpha z500 {alpha[Z500]:.2f} t850 {alpha[T850]:.2f} "
             f"min {alpha.min():.2f} ({names[int(alpha.argmin())]})")
 
