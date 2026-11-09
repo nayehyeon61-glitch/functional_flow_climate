@@ -20,6 +20,7 @@ MODELS = [
     ("C_FM_OT_GRF_stoch", "C  B + per-step FM error", "#1baf7a"),
     ("D_FM_indep_white", "D  FM (indep, white) → SFNO", "#eda100"),
     ("E_standin_climateODE", "E  stand-in → climate ODE", "#6250d6"),
+    ("F_ClimODE_orig", "F  ClimODE (original ckpt, Gaussian samples)", "#5f5f5a"),
 ]
 VARS = [("z500", "z500 [m²/s²]"), ("t850", "t850 [K]"), ("t2m", "t2m [K]")]
 
@@ -41,7 +42,9 @@ def main():
             ax.grid(axis="y", color="#e6e5e0", lw=0.8)
             for key, name, col in MODELS:
                 d = df[(df.model == key) & (df.metric == metric) & (df.variable == v)].sort_values("lead_hours")
-                ax.plot(d.lead_hours, d.value, color=col, lw=2, label=name)
+                if len(d) == 0:
+                    continue
+                ax.plot(d.lead_hours, d.value, color=col, lw=2, ls="--" if key.startswith("F_") else "-", label=name)
             if metric == "ssr":
                 ax.axhline(1.0, color="#5f5f5a", lw=1, ls="--")
                 ax.set_xlabel("lead [h]")
@@ -49,7 +52,7 @@ def main():
                          loc="left")
             ax.set_xticks([24, 48, 72, 96, 120, 144])
     h, l = axes[0, 0].get_legend_handles_labels()
-    fig.legend(h, l, loc="upper center", ncol=5, frameon=False, fontsize=8.5)
+    fig.legend(h, l, loc="upper center", ncol=3, frameon=False, fontsize=8.5)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     fig.savefig(a.out, dpi=150)

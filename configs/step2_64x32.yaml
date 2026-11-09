@@ -22,3 +22,8 @@ long:
   fields: "--iters 12000 --batch 4 --K 12 --curriculum 1 2 4 8 12 --val-K 12 --val-every 500"   # tags sfno_h1_pinn_long, climate_ode_long
   run: "FIELD=sfno_h1_pinn_long CLIMODE=climate_ode_long bash scripts/run_step2.sh"
   calibration: {standin_sfno: 2, standin_climode: 2, fm_ot_matched: 2, fm_indep_white: 2, fm_ot_stochastic: {kappa: 2, kappa_s: 0.5}}
+# --- arm F (2026-11-09): the original ClimODE (published ckpt, authors' code) on the same 72 ICs. docs/step2_retrain_results.md section 4
+climode_original:
+  data: "third_party/pgflow/scripts/wb2_to_kai.py --out data/era5_5p625 --years 2006 ... 2018 --climode-only"   # 5 variables, WB1-style
+  predict: "scripts/run_climode_original.py --data data/era5_5p625/era5_data --out runs/step3/climode_orig --part k/2 --threads 2"  # ~9 min/IC
+  score: "scripts/run_climode_original.py ... --score --kai data/era5_5p625/kai6h --eval-dir runs/step3/eval_2017 --members 8"   # F_ClimODE_orig(_det)

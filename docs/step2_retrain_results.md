@@ -21,6 +21,11 @@
 - **climate ODE(ResNet) 앙상블 E는 더 앞서 갔다**(A 대비 0.902, 이전 0.866 → 격차 유지). 결정론에서도 ResNet의 개선 폭이 더 컸다
   (24 h 220 → 184 vs SFNO 285 → 237).
 
+- **원본 ClimODE(공개 체크포인트, arm F)도 같은 72 IC에서 돌렸다(4절).** 결정론 z500 RMSE 205 / 497 / 875, t850 1.34 / 2.49 / 4.19,
+  t2m 2.28 / 3.07 / 5.44. 24 h의 z500·t850은 우리 재학습 climate ODE와 비슷하거나 낫지만(t850 1.34 vs 1.53), 72 h 이후와 t2m(00 UTC
+  IC에서 일주기 편향)은 크게 뒤지고, Gaussian 불확실성의 spread가 너무 작아(z500 SSR 0.65 → 0.17) 3변수 CRPS(A = 1)는 1.48로 모든
+  우리 앙상블(E 0.92, C 0.97)보다 나쁘다.
+
 ## 1. 동역학장 재학습
 
 | | Step 1 (3000 it, K 8) | 이번 (12000 it, K 12) |
@@ -123,3 +128,55 @@ KAI=$KAI STEP1=runs/step3 OUT=runs/step3 FIELD=sfno_h1_pinn_long CLIMODE=climate
 ```
 
 가중치: `/mnt/project-files/step3/` (프로젝트 공유 폴더).
+
+## 4. 원본 ClimODE 기준선 (arm F): 공개 체크포인트를 원저자 코드로
+
+1–3절의 "climate ODE"는 ClimODE의 네트워크(`Climate_ResNet_2D`)만 가져와 우리 solver·손실·66채널 자료로 다시 학습한 것이다.
+요청("원본 유지")에 따라 **ClimODE 원본**, 즉 원저자 코드(Aalto-QuML/ClimODE e729d23, pg-flow `third_party/climode`에 vendoring)와
+공개 체크포인트 `ClimODE_global.pt`(2.75 M 파라미터)를 그대로 같은 72개 IC에서 144 h까지 돌려 같은 WB2 코드로 채점했다
+(`scripts/run_climode_original.py`; 닫힌식 Gaussian CRPS는 [step2/crps_gauss_F_ClimODE_orig.json](step2/crps_gauss_F_ClimODE_orig.json)).
+
+| 항목 | 원본 ClimODE (F) | 우리 arm (A–E) |
+|---|---|---|
+| 코드·가중치 | upstream 그대로: 자료 로더, IC별 속도장 적합(`Optim_velocity`, Gaussian kernel, Adam 200 step), 이류 PDE + ResNet·attention, 1 h Euler, Gaussian emission head | `ffc` |
+| 자료 | 같은 WB2 5.625° zarr를 ClimODE 형식 5변수(z500, t850, t2m, u10, v10)로, 2006–2018 min-max 정규화 | KAI 67채널, 2010–2017 |
+| 학습 기간 | 2006–2015 (원저자, 10년) | 2010–2015 (6년) |
+| 평가 루프 | upstream `evaluation_global.py`와 같게: 2017·2018의 같은 시각을 한 배치(2)로, `model.eval()` 없이(batch norm이 그 배치 통계, dropout on) | — |
+| IC | 우리와 같은 72개(2017, 00 UTC, 5일 간격); 첫 IC들의 과거 2프레임은 2016년 끝에서 | 같음 |
+| 불확실성 | 격자점별 N(mean, std)에서 8개 독립 표본 → 다른 arm과 같은 fair CRPS·spread; 닫힌식 Gaussian CRPS와 일치 확인(z500 24 h 121.2 = 121.2) | 8멤버 |
+| 비용 (CPU) | IC당 속도장 8 s + 적분 약 9분 → 72 IC를 2 프로세스로 5.4 h | — |
+
+### WB2 2017 (72 IC, 24 / 72 / 144 h)
+
+| model | z500 RMSE | z500 ACC | t850 RMSE | t2m RMSE | z500 편향 | t2m 편향 |
+|---|---|---|---|---|---|---|
+| **F 원본 ClimODE (mean)** | 205 / 497 / 875 | 0.966 / 0.799 / 0.410 | **1.34** / 2.49 / 4.19 | 2.28 / 3.07 / 5.44 | −9 / −46 / −92 | −0.44 / −0.83 / −2.31 |
+| climate ODE (12000 it) | **184 / 425 / 722** | **0.972 / 0.847 / 0.533** | 1.53 / **2.37 / 3.34** | 1.51 / 2.36 / 3.11 | +2 / +8 / +17 | +0.24 / +0.43 / +0.50 |
+| SFNO (12000 it) | 237 / 508 / 746 | 0.954 / 0.768 / 0.432 | 1.65 / 2.62 / 3.43 | **1.40 / 2.29 / 2.98** | −4 / −32 / −78 | −0.14 / −0.22 / −0.12 |
+| ClimODE 논문 (12 UTC IC, 2017–18) | 193 / 479 / 784 | — | 1.55 / 2.58 / 3.62 | 1.40 / 2.75 / 3.30 | — | — |
+
+| model (앙상블) | z500 CRPS | t850 CRPS | t2m CRPS | z500 SSR | 3변수 CRPS 비율 (A = 1) 24 / 72 / 144 / 평균 |
+|---|---|---|---|---|---|
+| A 대역 → SFNO | 118 / 244 / 354 | 0.86 / 1.38 / 1.79 | 0.90 / 1.17 / 1.46 | 1.26 / 0.71 / 0.52 | 1 / 1 / 1 / 1 |
+| C FM + 스텝별 오차 → SFNO | 111 / 246 / 353 | 0.86 / 1.36 / 1.74 | 0.76 / 1.15 / 1.46 | 0.79 / 0.57 / 0.56 | 0.930 / 0.994 / 0.991 / 0.965 |
+| E 대역 → climate ODE | **107 / 206 / 310** | 0.81 / **1.25 / 1.63** | 0.79 / **1.13 / 1.43** | 1.67 / 1.06 / 0.81 | **0.910 / 0.905 / 0.922 / 0.921** |
+| **F 원본 ClimODE (Gaussian)** | 121 / 298 / 512 | **0.74** / 1.50 / 2.58 | 1.03 / 1.68 / 3.21 | 0.65 / 0.24 / 0.17 | 1.011 / 1.247 / 1.694 / 1.478 |
+
+(전체 표 [step2/wb2_tables_long.md](step2/wb2_tables_long.md); 그림 [step2/fig_crps_ssr_long.png](step2/fig_crps_ssr_long.png)의 점선이 F.)
+
+### 해석
+
+- **24 h 이내에서는 원본 ClimODE가 강하다.** t850 24 h RMSE 1.34는 모든 arm 중 최저이고 z500 205도 논문 값(193)에 가깝다. 이류 PDE
+  구조와 IC별 속도장 적합은 짧은 lead의 온도·지오포텐셜 이류를 잘 잡는다. 24 h t850 CRPS 0.74도 최저다.
+- **72 h 이후는 감쇠한다.** z500 144 h 875(climate ODE 722, SFNO 746), 편향 −92 m²/s², t2m 편향 −2.3 K. Step 1의 SFNO와 같은
+  "에너지 손실형" 장기 오차이고, 우리 재학습 ResNet은 10년이 아니라 6년 자료로 학습했는데도 z500의 모든 lead에서 더 정확하다.
+- **t2m는 프로토콜 민감성이 크다.** 원본의 t2m RMSE가 lead 0 / 6 / 12 / 24 h에서 2.3 / 4.1 / 4.9 / 2.3 K로 일주기 패턴을 보인다.
+  공개 체크포인트는 12 UTC IC(2일 간격)로 학습·평가되었고, 00 UTC IC에서는 emission head가 t2m에 큰 편향을 낸다. 같은 코드를 12 UTC
+  IC로 돌린 pg-flow 11단계(1월 16개 IC)에서는 t2m 6 / 24 h 1.97 / 2.76이었다. 즉 F의 t2m은 ClimODE의 최선이 아니라 "원본을 우리
+  프로토콜에 그대로 넣었을 때"의 값이며, z500·t850에는 이런 패턴이 없다.
+- **Gaussian 불확실성은 과소산포다.** spread/skill이 24 h 0.65에서 144 h 0.17로 떨어져 3변수 CRPS는 72 h 1.25배, 144 h 1.69배(A 대비).
+  반면 우리 앙상블은 E 0.92, C 0.97로 모두 F보다 낫고, 72 h 이후에는 결정론 SFNO·climate ODE의 MAE(1.33 / 1.26)보다도 F가 나쁘다.
+  Step 2의 결론과 같다: 동역학장 위에 spread를 유지하는 생성기(또는 대역 섭동)를 두는 쪽이 격자점별 분산 head보다 보정에 유리하다.
+- **한계.** u10·v10은 KAI 계약에 없어 공통 표에서 뺐고, ACC 기후값은 모든 arm에 같은 2010–2015 일·시각 기후값을 썼다. ClimODE를
+  12 UTC IC로 다시 돌리거나(`--stride`와 IC 시각 변경) `--eval-mode`(batch norm running 통계)로 돌리는 변형은 비용(IC당 9분) 때문에
+  하지 않았다.
