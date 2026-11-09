@@ -26,3 +26,6 @@ torchcfm==1.0.7        # pip install --no-deps torchcfm==1.0.7 ; plus `pot`
 pot
 torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git
 tqdm
+# Step 4 physics core (ffc/physcore.py): dinosaur (NeuralGCM's JAX spectral dynamical core) on CPU JAX
+jax[cpu]
+dinosaur                   # or pip install -e ../dinosaur (project fork)

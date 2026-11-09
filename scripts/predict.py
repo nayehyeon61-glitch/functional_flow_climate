@@ -42,9 +42,10 @@ def load_model(run: str, tag: str, kai: str, year: int, dev):
     stats = os.path.join(run, "stats")
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
     lat, lon = D.grid_of(kai, year)
-    static = D.static_features(lat, lon, D.orography(kai, year))
+    orog = D.orography(kai, year)
+    static = D.static_features(lat, lon, orog)
     cfg = FieldConfig(**info["cfg"])
-    model = DynamicsField(cfg, static, torch.tensor(info["t6"]), mean, std, lat, len(lon)).to(dev)
+    model = DynamicsField(cfg, static, torch.tensor(info["t6"]), mean, std, lat, len(lon), orog_si=orog).to(dev)
     model.load_state_dict(torch.load(os.path.join(run, f"{tag}.pt"), map_location=dev))
     model.eval()
     return model, info, mean, std, lat, lon
