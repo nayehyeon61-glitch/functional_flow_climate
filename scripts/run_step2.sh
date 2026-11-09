@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 KAI=${KAI:-data/era5_5p625/kai6h}; STEP1=${STEP1:-runs/step1}; OUT=${OUT:-runs/step2}
-FIELD=${FIELD:-sfno_h1_pinn}; M=${M:-8}; T=${THREADS:-2}; CACHE=${CACHE:-$OUT/cache}
+FIELD=${FIELD:-sfno_h1_pinn}; CLIMODE=${CLIMODE:-climate_ode}; M=${M:-8}; T=${THREADS:-2}; CACHE=${CACHE:-$OUT/cache}
 mkdir -p "$OUT"
 # memory-mapped normalized years, built once before parallel jobs read them (pgcfm.runs.load_years)
 python -c "import sys,numpy as np; sys.path.insert(0,'.'); import ffc; from ffc import data as D; \
@@ -22,18 +22,22 @@ wait
 # 2. scenario size on the validation year 2016 (fair CRPS of z500, t850, t2m, u850 at 24/72/144 h)
 cal() { python scripts/calibrate_ensemble.py --kai "$KAI" --run "$STEP1" --year 2016 --members "$M" --threads "$T" --cache "$CACHE" "$@"; }
 best() { python -c "import json,sys; print(json.load(open(sys.argv[1]))['best'])" "$1"; }
-cal --tag "$FIELD" --generator standin --sizes 0.5 1 2 4 8 --out "$OUT/cal_standin_$FIELD.json"
-cal --tag climate_ode --generator standin --sizes 0.5 1 2 4 --out "$OUT/cal_standin_climate_ode.json"
+# two calibrations at a time (each uses T threads)
+cal --tag "$FIELD" --generator standin --sizes 0.5 1 2 4 8 --out "$OUT/cal_standin_$FIELD.json" &
+cal --tag "$CLIMODE" --generator standin --sizes 0.5 1 2 4 --out "$OUT/cal_standin_$CLIMODE.json" &
+wait
 for f in fm_ot_matched fm_indep_white; do
-    cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag $f --sizes 1 2 4 8 16 --out "$OUT/cal_$f.json"
+    cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag $f --sizes 1 2 4 8 16 --out "$OUT/cal_$f.json" &
 done
+wait
 K=$(best "$OUT/cal_fm_ot_matched.json")
 # stochastic arm: IC size kappa in {kappa_IC, kappa_IC / 2} x per-step size kappa_s (run: kappa 2, kappa_s 0.5 won)
 KH=$(python -c "print($K / 2)")
 for k in "$K" "$KH"; do
     cal --tag "$FIELD" --generator flow --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$k" \
-        --stochastic-sizes 0.25 0.5 1 2 --out "$OUT/cal_fm_ot_matched_stoch_k$k.json"
+        --stochastic-sizes 0.25 0.5 1 2 --out "$OUT/cal_fm_ot_matched_stoch_k$k.json" &
 done
+wait
 read KS KS_S < <(python -c "import json,sys; r=[json.load(open(f)) for f in sys.argv[1:]]; \
 b=min(r, key=lambda q: q['scores'][str(q['best'])]['crps_mean']); print(b['kappa'], b['best'])" "$OUT"/cal_fm_ot_matched_stoch_k*.json)
 
@@ -48,13 +52,13 @@ run() { local name=$1 file=$OUT/$2 keep=$3; shift 3
     [ "$keep" = keep ] || rm -f "$file"
 }
 run SFNO_det sfno_det.nc keep --tag "$FIELD"
-run climateODE_det climode_det.nc keep --tag climate_ode
+run climateODE_det climode_det.nc keep --tag "$CLIMODE"
 run A_standin_SFNO A.nc del --members "$M" --tag "$FIELD" --alpha "$(best "$OUT/cal_standin_$FIELD.json")"
 run B_FM_OT_GRF B.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$K"
 run C_FM_OT_GRF_stoch C.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_ot_matched --kappa "$KS" --kappa-s "$KS_S"
 run D_FM_indep_white D.nc del --members "$M" --tag "$FIELD" --flow-run "$OUT" --flow-tag fm_indep_white \
     --kappa "$(best "$OUT/cal_fm_indep_white.json")"
-run E_standin_climateODE E.nc del --members "$M" --tag climate_ode --alpha "$(best "$OUT/cal_standin_climate_ode.json")"
+run E_standin_climateODE E.nc del --members "$M" --tag "$CLIMODE" --alpha "$(best "$OUT/cal_standin_$CLIMODE.json")"
 python scripts/evaluate.py --kai "$KAI" --year 2017 --clim-years 2010-2015 --leads 24,72,144 --out "$OUT/eval_2017" \
     --forecast "SFNO_det=$OUT/sfno_det.nc" --forecast "climateODE_det=$OUT/climode_det.nc" \
     $(for n in A_standin_SFNO B_FM_OT_GRF C_FM_OT_GRF_stoch D_FM_indep_white E_standin_climateODE; do echo "--forecast $n=$OUT/$n.nc"; done)
