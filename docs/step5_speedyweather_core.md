@@ -17,6 +17,8 @@ julialang-s3 / pkg.julialang.org / install.julialang.org와 github.com HTTP 다�
 2. `JULIA_PKG_SERVER=""`로 두면 Pkg가 General registry와 패키지를 git으로 clone한다.
 3. SpeedyWeather의 경계조건 에셋(지형, 해륙 마스크, SST 기후값 등)은 SpeedyWeatherAssets를 git clone한 뒤 `file://` URL로 artifact에 등록한다.
 
+![구조](step5/fig_structure.png)
+
 ## 2. 코어 단독 6 h 증분 (2016, 16 상태, `validate_core.py`)
 
 z500 persistence RMSE는 226 m다.
