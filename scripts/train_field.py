@@ -67,6 +67,8 @@ def parse(argv=None):
     p.add_argument("--core-dfi-h", type=float, default=6.0)
     p.add_argument("--core-physics", default="all",
                    help="speedy: all | none (adiabatic) | comma list of parameterizations to switch off")
+    p.add_argument("--history", type=int, nargs="*", default=[],
+                   help="Step 6: lags (6 h steps) of past states given to the operator, e.g. 2 4 = x(t-12h), x(t-24h)")
     p.add_argument("--core-calib", type=int, default=64, help="training pairs for the per-channel core weight alpha")
     # loss
     p.add_argument("--K", type=int, default=8, help="training window (6 h steps)")
@@ -139,9 +141,10 @@ def main(argv=None):
     # -- model -------------------------------------------------------------------------------------------
     cfg = FieldConfig(backbone=a.backbone, width=a.width, n_layers=a.layers, modes_lat=a.modes_lat,
                       modes_lon=a.modes_lon, dt_hours=a.dt_hours, solver=a.solver, positive=not a.no_positive,
-                      core=a.core, core_cfg=core_cfg_of(a))
+                      core=a.core, core_cfg=core_cfg_of(a), history=a.history or None)
     model = DynamicsField(cfg, static, t6v, mean, std, lat, W, orog_si=orog_si).to(dev)
     model.grad_ckpt = a.grad_ckpt
+    NH = model.n_history
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "tag": tag, "grid": [H, W], "n_params": model.n_params(),
            "t6": t6v.tolist(), "run": run_record(dev)}
     if model.core is not None:
@@ -202,11 +205,13 @@ def main(argv=None):
             step["it"] += 1
 
         def loss_of(batch):
-            x0, d, orog, hour0 = (q.to(dev) for q in batch)
+            x0, d, orog, hour0, past = (None if q is None else q.to(dev) for q in batch)
             K = cur_K()
             model.cache_core = [] if model.core is not None else None
-            y = model.rollout(x0, hour0, K, tisr_of(x0, d, K))
+            model.cache_hist = [] if NH else None
+            y = model.rollout(x0, hour0, K, tisr_of(x0, d, K), past)
             cache, model.cache_core = model.cache_core, None
+            hcache, model.cache_hist = model.cache_hist, None
             err = y - x0[:, None]
             l2 = D.wmse(err, d[:, :K], w, t6)
             loss, parts = l2, {"l2": l2.item(), "K": float(K)}
@@ -221,7 +226,7 @@ def main(argv=None):
                     xs = x0 if k == 0 else y[:, k - 1]
                     xo = x0 if k == 0 else x0 + d[:, k - 1]
                     ci = cache[k] if cache is not None and k < len(cache) else None
-                    f = model.tendency(xs, hour0 + 6.0 * k, ci)
+                    f = model.tendency(xs, hour0 + 6.0 * k, ci, hcache[k] if hcache is not None else None)
                     m = phys.mean_squares(xs, orog, f, xo)
                     ms = m if ms is None else {q: ms[q] + m[q] for q in m}
                 ms = {q: v / len(ks) for q, v in ms.items()}
@@ -232,9 +237,10 @@ def main(argv=None):
             return loss, parts
 
         n_val_time = len(data[a.val_year])
-        val_idx = D.fixed_windows(n_val_time, a.val_K, a.n_val)
+        val_idx = D.fixed_windows(n_val_time, a.val_K, a.n_val, offset=NH)
         vx0, vd, vorog, vh = D.gather(data, [a.val_year] * len(val_idx), val_idx, a.val_K)
         vx0, vd, vorog, vh = (q.to(dev) for q in (vx0, vd, vorog, vh))
+        vpast = D.gather_past(data, [a.val_year] * len(val_idx), val_idx, NH).to(dev) if NH else None
         sd = torch.as_tensor(std[DYN], dtype=torch.float32, device=dev)
 
         def val_fn():
@@ -242,7 +248,8 @@ def main(argv=None):
             l2s, z24, t24, z72 = [], [], [], []
             for i in range(0, len(vx0), chunk):
                 sl = slice(i, i + chunk)
-                y = model.rollout(vx0[sl], vh[sl], a.val_K, tisr_of(vx0[sl], vd[sl], a.val_K))
+                y = model.rollout(vx0[sl], vh[sl], a.val_K, tisr_of(vx0[sl], vd[sl], a.val_K),
+                                  None if vpast is None else vpast[sl])
                 e = y - vx0[sl][:, None] - vd[sl][:, :a.val_K]
                 l2s.append(D.wmse(y - vx0[sl][:, None], vd[sl][:, :a.val_K], w, t6).item() * (sl.stop - sl.start))
                 ww = w.view(1, -1, 1)
@@ -257,8 +264,9 @@ def main(argv=None):
                 out["z500_72h"] = sum(z72) / n
             return out
 
-        batches = Prefetch(lambda r: D.pick(data, a.train_years, a.K, r, a.batch),
-                           lambda p: D.gather(data, *p, a.K), rng, depth=a.prefetch)
+        batches = Prefetch(lambda r: D.pick_hist(data, a.train_years, a.K, r, a.batch, NH),
+                           lambda p: (*D.gather(data, *p, a.K), D.gather_past(data, *p, NH) if NH else None),
+                           rng, depth=a.prefetch)
         fcfg = FitConfig(iters=a.iters, ckpt_every=a.ckpt_every, log_every=max(1, min(50, a.iters // 10)),
                          val_every=a.val_every, patience=a.patience, select=a.select, max_hours=a.max_hours, clip=a.clip)
         t0 = time.time()
@@ -276,10 +284,19 @@ def main(argv=None):
     model.eval()
     with torch.no_grad():
         n_val_time = len(data[a.val_year])
-        val_idx = D.fixed_windows(n_val_time, a.val_K, a.n_val)
+        val_idx = D.fixed_windows(n_val_time, a.val_K, a.n_val, offset=NH)
         vx0, vd, vorog, vh = (q.to(dev) for q in D.gather(data, [a.val_year] * len(val_idx), val_idx, a.val_K))
-        y = torch.cat([model.rollout(vx0[i:i + 2], vh[i:i + 2], a.val_K, tisr_of(vx0[i:i + 2], vd[i:i + 2], a.val_K))
-                       for i in range(0, len(vx0), 2)])
+        vpast = D.gather_past(data, [a.val_year] * len(val_idx), val_idx, NH).to(dev) if NH else None
+        ys, h_ic, h_end = [], [], []
+        for i in range(0, len(vx0), 2):
+            model.cache_hist = [] if NH else None
+            ys.append(model.rollout(vx0[i:i + 2], vh[i:i + 2], a.val_K, tisr_of(vx0[i:i + 2], vd[i:i + 2], a.val_K),
+                                    None if vpast is None else vpast[i:i + 2]))
+            if NH:
+                h_ic.append(model.cache_hist[0]), h_end.append(model.cache_hist[-1])
+            model.cache_hist = None
+        y = torch.cat(ys)
+        h_ic, h_end = (torch.cat(h) if h else None for h in (h_ic, h_end))
         truth = vx0[:, None] + vd[:, :a.val_K]
         sd = torch.as_tensor(std[DYN], dtype=torch.float32, device=dev)
         ww = w.view(1, -1, 1)
@@ -290,8 +307,8 @@ def main(argv=None):
             "z500_persistence": [float((((vx0[:, None] - truth)[:, k, Z500] * sd[Z500]) ** 2 * ww).mean().sqrt()) for k in range(a.val_K)],
         }
         if phys is not None:
-            f_roll = model.tendency(y[:, -1], vh + 6.0 * a.val_K)
-            f_ic = model.tendency(vx0, vh)
+            f_roll = model.tendency(y[:, -1], vh + 6.0 * a.val_K, None, h_end)
+            f_ic = model.tendency(vx0, vh, None, h_ic)
             res["val_strong_residual_over_era5"] = {
                 "ic": phys.per_equation(vx0, vorog, f_ic),
                 f"lead_{6 * a.val_K}h": phys.per_equation(y[:, -1], vorog, f_roll, x_obs=truth[:, -1]),

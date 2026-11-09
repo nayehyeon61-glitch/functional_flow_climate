@@ -83,3 +83,23 @@ def test_hybrid_starts_as_the_core():
     ci = m.core_increment(x, hours)
     assert torch.allclose(m.tendency(x, hours), ci)          # zero head: the hybrid is the core alone
     m.core.close()
+
+
+def test_sequence_field_slides_its_history():
+    """Step 6: a history field sees x(t), x(t - 12 h), x(t - 24 h); along the rollout the sequence slides."""
+    contract.register_latitudes(LAT)
+    cfg = FieldConfig(backbone="sfno", width=8, n_layers=1, modes_lat=8, positive=False, history=[2, 4])
+    m = DynamicsField(cfg, torch.randn(7, H, W), torch.ones(N), np.zeros(contract.N_CHANNELS),
+                      np.ones(contract.N_CHANNELS), LAT, W)
+    assert m.n_history == 4
+    x, hours = torch.randn(2, N, H, W), torch.zeros(2)
+    past = torch.randn(2, 4, N, H, W)
+    with pytest.raises(ValueError):
+        m.rollout(x, hours, 1)
+    m.cache_hist = []
+    y = m.rollout(x, hours, 3, past=past)
+    hc, m.cache_hist = m.cache_hist, None
+    assert y.shape == (2, 3, N, H, W) and len(hc) == 4
+    assert torch.allclose(hc[0], torch.cat([(x - past[:, 2]) / 2, (past[:, 2] - past[:, 0]) / 2], 1))
+    # third step: x(t) = y_2, x(t - 12 h) = x0, x(t - 24 h) = past[-2]
+    assert torch.allclose(hc[2], torch.cat([(y[:, 1] - x) / 2, (x - past[:, 2]) / 2], 1), atol=1e-6)

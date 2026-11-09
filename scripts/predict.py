@@ -97,8 +97,18 @@ def main(argv=None):
     if a.flow_tag:
         flow, _ = load_flow(a.flow_run, a.flow_tag, model, dev)
     standin = a.members > 1 and a.pgflow_ens is None and flow is None
-    data = D.load_years(a.kai, [a.year] + (train_years if standin else []), mean, std, cache=a.cache)
+    NH = model.n_history   # Step 6 sequence fields: the states before each IC (from the previous year in January)
+    prev = [a.year - 1] if NH and os.path.exists(os.path.join(a.kai, f"{a.year - 1}.nc")) else []
+    data = D.load_years(a.kai, [a.year] + prev + [y for y in (train_years if standin else []) if y not in prev],
+                        mean, std, cache=a.cache)
     x_year = data[a.year]
+
+    def past_of(i):
+        if i >= NH:
+            return x_year[i - NH:i][:, DYN]
+        if not prev:
+            raise ValueError(f"IC {i} needs {NH} earlier states: add {a.year - 1}.nc or skip it")
+        return torch.cat([data[a.year - 1][len(data[a.year - 1]) - (NH - i):], x_year[:i]])[:, DYN]
     steps = int(round(a.max_lead_hours / 6.0))
     keep = [k for k in range(steps) if (6.0 * (k + 1)) % a.lead_every_hours == 0]  # rollout steps written
     lead_hours = [0.0] + [6.0 * (k + 1) for k in keep]
@@ -153,7 +163,8 @@ def main(argv=None):
             if flow is not None and a.kappa_s > 0:
                 y = F.rollout_stochastic(flow, model, x0, hour0, steps, a.kappa_s, tisr, gen)[:, :, keep_t]
             else:
-                y = model.rollout_members(x0, hour0, steps, tisr)[:, :, keep_t]  # (b, M, L-1, 66, H, W)
+                past = torch.stack([past_of(i) for i in idx]).to(dev) if NH else None
+                y = model.rollout_members(x0, hour0, steps, tisr, past)[:, :, keep_t]  # (b, M, L-1, 66, H, W)
             full0 = assemble_full_state(x0, orog[:, None].expand(-1, M, -1, -1, -1))
             fully = assemble_full_state(y, orog[:, None, None].expand(-1, M, len(keep), -1, -1, -1))
             allx = torch.cat([full0[:, :, None], fully], 2)  # (b, M, L, 67, H, W)

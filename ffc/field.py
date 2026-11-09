@@ -61,6 +61,8 @@ class FieldConfig:
     lat_padding: float = 0.125   # fno: neuraloperator domain padding in latitude (fraction of H)
     core: str = ""               # "" (pure operator) | "dinosaur" | "speedy" (physics core + operator residual)
     core_cfg: Optional[dict] = None  # ffc.physcore.CoreConfig / ffc.speedycore.SpeedyConfig fields
+    history: Optional[list] = None   # Step 6: lags in 6 h steps of the past states the operator sees, e.g. [2, 4]
+    #                                  = x(t - 12 h), x(t - 24 h): the field becomes an operator on the sequence
 
 
 def _zero_last_layer(module: nn.Module) -> None:
@@ -127,12 +129,14 @@ class DynamicsField(nn.Module):
                 from .speedycore import SpeedyConfig, SpeedyCore
                 self.core = SpeedyCore(SpeedyConfig(**(cfg.core_cfg or {})), mean, std, lat_deg, orog_si)
             self.register_buffer("core_alpha", torch.ones(1, N_DYN, 1, 1))
-        n_in = N_DYN + static.shape[0] + N_TIME + (N_DYN if self.core is not None else 0)
+        self.lags = sorted(int(k) for k in (cfg.history or []))
+        n_in = N_DYN + static.shape[0] + N_TIME + (N_DYN if self.core is not None else 0) + N_DYN * len(self.lags)
         self.net = make_backbone(n_in, N_DYN, cfg, static.shape[-2], n_lon)
         dyn = contract.DYNAMIC_CHANNELS
         self.pm = PositiveMass(mean[dyn], std[dyn], lat_deg) if cfg.positive else None
         self.grad_ckpt = False  # per 6 h step gradient checkpointing for long rollouts (set by the trainer)
         self.cache_core = None  # a list: the core increments of every step are appended (the trainer's PINN term)
+        self.cache_hist = None  # a list: the history features of every step (same use)
 
     # -- the field ---------------------------------------------------------------------------------------
     def _core_raw(self, x: torch.Tensor, hours: Optional[torch.Tensor]) -> torch.Tensor:
@@ -157,11 +161,32 @@ class DynamicsField(nn.Module):
         self.core_alpha.copy_(alpha.view(1, -1, 1, 1))
         return alpha
 
-    def tendency(self, x: torch.Tensor, hours: torch.Tensor, core_inc: Optional[torch.Tensor] = None) -> torch.Tensor:
+    @property
+    def n_history(self) -> int:
+        """Past states (6 h apart, oldest first) a rollout needs before x0: the largest lag, 0 without history."""
+        return max(self.lags) if self.lags else 0
+
+    def history_features(self, buf) -> Optional[torch.Tensor]:
+        """The sequence x(t - lag_n), ..., x(t - lag_1), x(t) as the operator sees it: the successive differences
+        (x(t) - x(t - lag_1)), (x(t - lag_1) - x(t - lag_2)), ... in units of the 6 h tendency std per lag step,
+        (B, 66 * n_lags, H, W). ``buf`` is the list of states every 6 h ending with x(t). The differences carry
+        the same information as the raw past states (x itself is an input too) at the scale the head works in:
+        the observed velocity and acceleration of the flow."""
+        if not self.lags:
+            return None
+        pts = [buf[-1]] + [buf[-1 - k] for k in self.lags]
+        steps = [self.lags[0]] + [b - a for a, b in zip(self.lags[:-1], self.lags[1:])]
+        return torch.cat([(pts[i] - pts[i + 1]) / (self.t6 * n) for i, n in enumerate(steps)], 1) * 1.0
+
+    def tendency(self, x: torch.Tensor, hours: torch.Tensor, core_inc: Optional[torch.Tensor] = None,
+                 hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         """G_theta(x, t): normalized increment per 6 h, (B, 66, H, W). With a physics core it is
-        F_phys + R_theta(x, F_phys / t6, t); ``core_inc`` is F_phys if already known (computed otherwise)."""
+        F_phys + R_theta(x, F_phys / t6, t); ``core_inc`` is F_phys if already known (computed otherwise).
+        ``hist`` are the ``history_features`` of the step's start (zeros when a history field gets none)."""
         B, _, H, W = x.shape
         parts = [x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
+        if self.lags:
+            parts.append(hist if hist is not None else x.new_zeros(B, N_DYN * len(self.lags), H, W))
         if self.core is not None:
             if core_inc is None:
                 core_inc = self.core_increment(x, hours)
@@ -169,7 +194,8 @@ class DynamicsField(nn.Module):
         out = self.net(torch.cat(parts, 1)) * self.t6 * self.keep
         return out if core_inc is None else out + core_inc
 
-    def step(self, x: torch.Tensor, hours: torch.Tensor, tisr_next: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def step(self, x: torch.Tensor, hours: torch.Tensor, tisr_next: Optional[torch.Tensor] = None,
+             hist: Optional[torch.Tensor] = None) -> torch.Tensor:
         """One 6 h step: torchdiffeq fixed-grid solve of dx/ds = G(x, hours + 6 s), s in [0, 1]. A physics core
         increment is computed once from the step's start state and held fixed over the step."""
         from torchdiffeq import odeint
@@ -179,7 +205,7 @@ class DynamicsField(nn.Module):
             self.cache_core.append(ci)
 
         def func(s, y):
-            return self.tendency(y, hours + HOURS_PER_STEP * s, ci)
+            return self.tendency(y, hours + HOURS_PER_STEP * s, ci, hist)
 
         n_sub = max(1, int(round(HOURS_PER_STEP / self.cfg.dt_hours)))
         s = torch.tensor([0.0, 1.0], dtype=x.dtype, device=x.device)
@@ -191,27 +217,41 @@ class DynamicsField(nn.Module):
         return x
 
     def rollout(self, x0: torch.Tensor, hour0: torch.Tensor, steps: int,
-                tisr: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(B, steps, 66, H, W): the states 6 h, 12 h, ... after x0; ``tisr`` (B, steps, H, W) from the data."""
+                tisr: Optional[torch.Tensor] = None, past: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(B, steps, 66, H, W): the states 6 h, 12 h, ... after x0; ``tisr`` (B, steps, H, W) from the data.
+        ``past`` (B, n_history, 66, H, W): the states before x0 every 6 h, oldest first (history fields); along
+        the rollout the sequence slides over the field's own states."""
         x, hours, out = x0, hour0.float(), []
         ckpt = self.grad_ckpt and torch.is_grad_enabled()
+        buf = None
+        if self.lags:
+            if past is None or past.shape[1] < self.n_history:
+                raise ValueError(f"a history field needs the {self.n_history} states before x0 (past)")
+            buf = [past[:, i] for i in range(past.shape[1])] + [x0]
         for k in range(steps):
             tk = None if tisr is None else tisr[:, k]
+            hf = self.history_features(buf) if buf is not None else None
+            if hf is not None and self.cache_hist is not None:
+                self.cache_hist.append(hf)
             if ckpt:
-                x = torch.utils.checkpoint.checkpoint(self.step, x, hours, tk, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(self.step, x, hours, tk, hf, use_reentrant=False)
             else:
-                x = self.step(x, hours, tk)
+                x = self.step(x, hours, tk, hf)
             hours = hours + HOURS_PER_STEP
             out.append(x)
+            if buf is not None:
+                buf = buf[1:] + [x]
+        if buf is not None and self.cache_hist is not None:
+            self.cache_hist.append(self.history_features(buf))   # of the last state (the trainer's PINN term)
         return torch.stack(out, 1)
 
     def rollout_members(self, members: torch.Tensor, hour0: torch.Tensor, steps: int,
-                        tisr: Optional[torch.Tensor] = None) -> torch.Tensor:
+                        tisr: Optional[torch.Tensor] = None, past: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Ensemble scenarios (B, M, 66, H, W) -> (B, M, steps, 66, H, W); every member is a row of the batch
         (the field is the same operator for every member; tisr (B, steps, H, W) is shared)."""
         B, M = members.shape[:2]
         rep = lambda t: None if t is None else t.repeat_interleave(M, 0)  # noqa: E731
-        y = self.rollout(members.flatten(0, 1), rep(hour0), steps, rep(tisr))
+        y = self.rollout(members.flatten(0, 1), rep(hour0), steps, rep(tisr), rep(past))
         return y.view(B, M, *y.shape[1:])
 
     def state_dict(self, *args, **kwargs):
