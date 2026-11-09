@@ -8,6 +8,8 @@
                       strong primitive-equation residuals with the field's own tendency at random rollout states
                       (pg-flow pgcfm.physics; b_j = ERA5's level, target 1 = ERA5's level)
     arms    --backbone sfno | fno (neural operators)  --backbone resnet (ClimODE ResNet: the climate-ODE baseline)
+            --core dinosaur: hybrid dx/dt = alpha F_phys(x) + R_theta(x, F_phys), F_phys the 6 h increment of a
+            spectral primitive-equation core (ffc.physcore, Step 4); alpha calibrated on training pairs first
 
     python scripts/train_field.py --kai data/era5_5p625/kai6h --out runs/step1 --backbone sfno --lambda-sob 1 --lambda-p 0.05
 
@@ -57,6 +59,12 @@ def parse(argv=None):
     p.add_argument("--dt-hours", type=float, default=6.0)
     p.add_argument("--solver", default="midpoint", choices=["euler", "midpoint", "rk4", "heun3"])
     p.add_argument("--no-positive", action="store_true")
+    p.add_argument("--core", default="", choices=["", "dinosaur"], help="physics core under the operator (Step 4)")
+    p.add_argument("--core-trunc", type=int, default=21)
+    p.add_argument("--core-layers", type=int, default=18)
+    p.add_argument("--core-dt-min", type=float, default=30.0)
+    p.add_argument("--core-dfi-h", type=float, default=6.0)
+    p.add_argument("--core-calib", type=int, default=64, help="training pairs for the per-channel core weight alpha")
     # loss
     p.add_argument("--K", type=int, default=8, help="training window (6 h steps)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 4, 8])
@@ -114,15 +122,28 @@ def main(argv=None):
     t6v = D.tendency_std(data, a.train_years, DYN).clamp_min(1e-6)
     t6 = t6v.view(1, 1, -1, 1, 1).to(dev)
     w = D.lat_weights(lat, dev).view(1, 1, 1, -1, 1)
-    static = D.static_features(lat, lon, D.orography(a.kai, a.val_year))
+    orog_si = D.orography(a.kai, a.val_year)
+    static = D.static_features(lat, lon, orog_si)
 
     # -- model -------------------------------------------------------------------------------------------
     cfg = FieldConfig(backbone=a.backbone, width=a.width, n_layers=a.layers, modes_lat=a.modes_lat,
-                      modes_lon=a.modes_lon, dt_hours=a.dt_hours, solver=a.solver, positive=not a.no_positive)
-    model = DynamicsField(cfg, static, t6v, mean, std, lat, W).to(dev)
+                      modes_lon=a.modes_lon, dt_hours=a.dt_hours, solver=a.solver, positive=not a.no_positive,
+                      core=a.core, core_cfg=dict(truncation=a.core_trunc, layers=a.core_layers, dt_minutes=a.core_dt_min,
+                                                 dfi_hours=a.core_dfi_h) if a.core else None)
+    model = DynamicsField(cfg, static, t6v, mean, std, lat, W, orog_si=orog_si).to(dev)
     model.grad_ckpt = a.grad_ckpt
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "tag": tag, "grid": [H, W], "n_params": model.n_params(),
            "t6": t6v.tolist(), "run": run_record(dev)}
+    if model.core is not None:
+        crng = np.random.default_rng(a.seed + 7)
+        cx0, cd, _, _ = D.sample(data, a.train_years, 1, crng, a.core_calib)
+        tc = time.time()
+        alpha = model.calibrate_core(cx0.to(dev), cd[:, 0].to(dev), D.lat_weights(lat, dev))
+        names = [contract.CHANNEL_NAMES[c] for c in DYN]
+        res["core"] = {"alpha": dict(zip(names, alpha.tolist())), "seconds_per_state": (time.time() - tc) / a.core_calib}
+        log(f"[core] dinosaur T{a.core_trunc} L{a.core_layers} dt {a.core_dt_min:g} min DFI {a.core_dfi_h:g} h, "
+            f"{res['core']['seconds_per_state']:.3f} s/state; alpha z500 {alpha[Z500]:.2f} t850 {alpha[T850]:.2f} "
+            f"min {alpha.min():.2f} ({names[int(alpha.argmin())]})")
 
     # -- physics -----------------------------------------------------------------------------------------
     phys = None
@@ -173,7 +194,9 @@ def main(argv=None):
         def loss_of(batch):
             x0, d, orog, hour0 = (q.to(dev) for q in batch)
             K = cur_K()
+            model.cache_core = [] if model.core is not None else None
             y = model.rollout(x0, hour0, K, tisr_of(x0, d, K))
+            cache, model.cache_core = model.cache_core, None
             err = y - x0[:, None]
             l2 = D.wmse(err, d[:, :K], w, t6)
             loss, parts = l2, {"l2": l2.item(), "K": float(K)}
@@ -187,7 +210,8 @@ def main(argv=None):
                 for k in ks:
                     xs = x0 if k == 0 else y[:, k - 1]
                     xo = x0 if k == 0 else x0 + d[:, k - 1]
-                    f = model.tendency(xs, hour0 + 6.0 * k)
+                    ci = cache[k] if cache is not None and k < len(cache) else None
+                    f = model.tendency(xs, hour0 + 6.0 * k, ci)
                     m = phys.mean_squares(xs, orog, f, xo)
                     ms = m if ms is None else {q: ms[q] + m[q] for q in m}
                 ms = {q: v / len(ks) for q, v in ms.items()}

@@ -18,6 +18,14 @@ Backbones (``FieldConfig.backbone``):
             operator
 
 The output head of every backbone is zero-initialized: the field starts as persistence (pg-flow step 12).
+
+Physics core (Step 4, ``FieldConfig.core``): with ``core="dinosaur"`` the field is a hybrid
+``dx/dt = F_phys(x) + R_theta(x, F_phys(x), t)``: F_phys is alpha * (6 h increment of a spectral primitive-equation
+GCM started from x, ``ffc.physcore.SpectralCore``; the SpeedyWeather.jl role), computed once per 6 h step from
+the step's start state and held fixed over the step, no gradient; the operator sees it as an extra input and
+learns the residual. alpha (66,) is the per-channel least-squares weight of the core increment against ERA5's
+6 h change (``calibrate_core``), clipped to [0, 1], so levels where the core has no skill (50 hPa) are switched
+off. With the zero-initialized head the hybrid starts as the core alone.
 """
 
 import math
@@ -51,6 +59,8 @@ class FieldConfig:
     solver: str = "midpoint"     # torchdiffeq fixed-grid method: euler | midpoint | rk4 | heun3
     positive: bool = True        # PositiveMass after every 6 h step
     lat_padding: float = 0.125   # fno: neuraloperator domain padding in latitude (fraction of H)
+    core: str = ""               # "" (pure operator) | "dinosaur" (physics core + operator residual)
+    core_cfg: Optional[dict] = None  # ffc.physcore.CoreConfig fields
 
 
 def _zero_last_layer(module: nn.Module) -> None:
@@ -95,7 +105,8 @@ class DynamicsField(nn.Module):
     6 h tendency std per channel (the head's output unit), ``mean`` / ``std`` the 67-channel KAI statistics
     (PositiveMass), ``lat_deg`` the grid latitudes."""
 
-    def __init__(self, cfg: FieldConfig, static: torch.Tensor, t6: torch.Tensor, mean, std, lat_deg, n_lon: int):
+    def __init__(self, cfg: FieldConfig, static: torch.Tensor, t6: torch.Tensor, mean, std, lat_deg, n_lon: int,
+                 orog_si=None):
         super().__init__()
         self.cfg = cfg
         self.register_buffer("static", static)
@@ -103,24 +114,61 @@ class DynamicsField(nn.Module):
         keep = torch.ones(N_DYN)
         keep[TISR_DYN] = 0.0  # tisr is a known forcing, never predicted
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
-        self.net = make_backbone(N_DYN + static.shape[0] + N_TIME, N_DYN, cfg, static.shape[-2], n_lon)
+        self.core = None
+        if cfg.core:
+            if cfg.core != "dinosaur":
+                raise ValueError(f"unknown physics core {cfg.core!r}")
+            if orog_si is None:
+                raise ValueError("a physics core needs the surface geopotential orog_si (H, W)")
+            from .physcore import CoreConfig, SpectralCore
+            self.core = SpectralCore(CoreConfig(**(cfg.core_cfg or {})), mean, std, lat_deg, orog_si)
+            self.register_buffer("core_alpha", torch.ones(1, N_DYN, 1, 1))
+        n_in = N_DYN + static.shape[0] + N_TIME + (N_DYN if self.core is not None else 0)
+        self.net = make_backbone(n_in, N_DYN, cfg, static.shape[-2], n_lon)
         dyn = contract.DYNAMIC_CHANNELS
         self.pm = PositiveMass(mean[dyn], std[dyn], lat_deg) if cfg.positive else None
         self.grad_ckpt = False  # per 6 h step gradient checkpointing for long rollouts (set by the trainer)
+        self.cache_core = None  # a list: the core increments of every step are appended (the trainer's PINN term)
 
     # -- the field ---------------------------------------------------------------------------------------
-    def tendency(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
-        """G_theta(x, t): normalized increment per 6 h, (B, 66, H, W)."""
+    def core_increment(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """F_phys(x): alpha * the physics core's 6 h increment (normalized), no gradient; None without a core."""
+        if self.core is None:
+            return None
+        return self.core.increment(x) * self.core_alpha * self.keep
+
+    @torch.no_grad()
+    def calibrate_core(self, x0: torch.Tensor, d: torch.Tensor, lat_w: torch.Tensor) -> torch.Tensor:
+        """alpha_c = <D, d>_w / <D, D>_w per channel on ERA5 pairs (x0, d = x(6 h) - x0), clipped to [0, 1]."""
+        raw = self.core.increment(x0)
+        w = lat_w.view(1, 1, -1, 1)
+        alpha = ((raw * d * w).sum((0, 2, 3)) / (raw * raw * w).sum((0, 2, 3)).clamp_min(1e-12)).clamp(0.0, 1.0)
+        self.core_alpha.copy_(alpha.view(1, -1, 1, 1))
+        return alpha
+
+    def tendency(self, x: torch.Tensor, hours: torch.Tensor, core_inc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """G_theta(x, t): normalized increment per 6 h, (B, 66, H, W). With a physics core it is
+        F_phys + R_theta(x, F_phys / t6, t); ``core_inc`` is F_phys if already known (computed otherwise)."""
         B, _, H, W = x.shape
-        inp = torch.cat([x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1)
-        return self.net(inp) * self.t6 * self.keep
+        parts = [x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
+        if self.core is not None:
+            if core_inc is None:
+                core_inc = self.core_increment(x)
+            parts.append(core_inc / self.t6)
+        out = self.net(torch.cat(parts, 1)) * self.t6 * self.keep
+        return out if core_inc is None else out + core_inc
 
     def step(self, x: torch.Tensor, hours: torch.Tensor, tisr_next: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """One 6 h step: torchdiffeq fixed-grid solve of dx/ds = G(x, hours + 6 s), s in [0, 1]."""
+        """One 6 h step: torchdiffeq fixed-grid solve of dx/ds = G(x, hours + 6 s), s in [0, 1]. A physics core
+        increment is computed once from the step's start state and held fixed over the step."""
         from torchdiffeq import odeint
 
+        ci = self.core_increment(x)
+        if ci is not None and self.cache_core is not None:
+            self.cache_core.append(ci)
+
         def func(s, y):
-            return self.tendency(y, hours + HOURS_PER_STEP * s)
+            return self.tendency(y, hours + HOURS_PER_STEP * s, ci)
 
         n_sub = max(1, int(round(HOURS_PER_STEP / self.cfg.dt_hours)))
         s = torch.tensor([0.0, 1.0], dtype=x.dtype, device=x.device)

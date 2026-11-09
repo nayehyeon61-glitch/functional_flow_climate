@@ -13,6 +13,13 @@ an L2 + Sobolev `H^s` loss in the spherical-harmonic basis and a PINN term (stro
 residual with the field's own tendency). It reads and writes pg-flow ensemble files and is scored with
 WeatherBench2. Design and results: [docs/step1_design.md](docs/step1_design.md), [docs/step1_results.md](docs/step1_results.md).
 
+**Step 4: a spectral physics core under the operator** (the SpeedyWeather.jl role; backend dinosaur, NeuralGCM's
+JAX spectral GCM, because Julia cannot be installed in the cloud container). The field becomes
+`dx/dt = alpha * F_phys(x) + R_theta(x, F_phys(x), t)`: F_phys is the 6 h increment of a T21 moist primitive-equation
+core started from x, the SFNO learns the residual. At the Step 1 budget it beats both Step 1 SFNO and the climate ODE
+on WB2 2017 (z500 RMSE 209 / 479 / 748 m at 24 / 72 / 144 h). `ffc/physcore.py`, `--core dinosaur`,
+`scripts/run_step4.sh`; results: [docs/step4_physics_core.md](docs/step4_physics_core.md).
+
 | Path | What |
 | --- | --- |
 | `ffc/field.py` | `DynamicsField`: SFNO / FNO (neuraloperator) or ClimODE ResNet (baseline) tendency, torchdiffeq step, member-wise rollout |
@@ -25,6 +32,7 @@ WeatherBench2. Design and results: [docs/step1_design.md](docs/step1_design.md),
 | `scripts/train_field.py` | train one arm (field or baseline), resumable |
 | `scripts/predict.py` | rollouts from ERA5 ICs or from pg-flow members -> `forecast.nc` |
 | `scripts/evaluate.py` | WB2 scores of several forecast files + persistence |
+| `ffc/physcore.py` | Step 4 physics core: dinosaur spectral GCM 6 h increments of KAI states (SpeedyWeather-style auxiliary structure) |
 | `configs/step1_64x32.yaml` | the Step 1 arms and commands |
 | `third_party/pgflow`, `third_party/neuraloperator` | pinned submodules (pg-flow branch `claude/blend-sr-s1`, neuraloperator) |
 
