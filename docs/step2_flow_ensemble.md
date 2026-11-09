@@ -6,6 +6,8 @@ WeatherBench2 기준으로 Step 1 대역 앙상블과 climate ODE와 비교했�
 WB2 ERA5 64×32에 돌린 결과(`runs/step2/`)를 옮긴 것이다. 전체 표는 [step2/wb2_tables.md](step2/wb2_tables.md),
 원자료는 [step2/scores_2017.csv](step2/scores_2017.csv).
 
+**후속**: 동역학장을 12000 it로 다시 학습한 라운드의 결과는 [step2_retrain_results.md](step2_retrain_results.md).
+
 ## 0. 요약
 
 - **2단계 학습**: 1단계(Step 1)에서 SFNO가 동역학과 물리(PINN 힌지 + H¹ Sobolev)를 학습했고, 2단계에서는 그 가중치를

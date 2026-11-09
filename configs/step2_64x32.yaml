@@ -17,3 +17,8 @@ calibration:               # scripts/calibrate_ensemble.py, 16 ICs of 2016, 8 me
   fm_ot_stochastic: {kappa: [2, 4], kappa_s: [0.25, 0.5, 1, 2], chosen: {kappa: 2, kappa_s: 0.5}}
 predict: "--year 2017 --stride 20 --max-lead-hours 144 --members 8"   # 72 ICs at 00 UTC, every 5 days, 6 .. 144 h
 evaluate: "--clim-years 2010-2015 --leads 24,72,144"
+# --- improvement round 1 (2026-11-09): longer training, same design. docs/step2_retrain_results.md
+long:
+  fields: "--iters 12000 --batch 4 --K 12 --curriculum 1 2 4 8 12 --val-K 12 --val-every 500"   # tags sfno_h1_pinn_long, climate_ode_long
+  run: "FIELD=sfno_h1_pinn_long CLIMODE=climate_ode_long bash scripts/run_step2.sh"
+  calibration: {standin_sfno: 2, standin_climode: 2, fm_ot_matched: 2, fm_indep_white: 2, fm_ot_stochastic: {kappa: 2, kappa_s: 0.5}}
