@@ -91,6 +91,17 @@ def gather(data: Dict, ys, idx, K: int):
     return x0, seq[:, 1:, DYN] - x0[:, None], seq[:, 0, OROG], torch.tensor([HOURS_PER_STEP * i for i in idx])
 
 
+def pick_hist(data: Dict, years: Sequence[int], K: int, rng: np.random.Generator, n: int, n_hist: int):
+    """As ``pick`` with ``n_hist`` states left before every window start."""
+    ys = rng.choice(years, n)
+    return ys, [int(rng.integers(n_hist, len(data[y]) - K)) for y in ys]
+
+
+def gather_past(data: Dict, ys, idx, n_hist: int) -> torch.Tensor:
+    """(n, n_hist, 66, H, W): the states before each window start every 6 h, oldest first."""
+    return torch.stack([data[y][i - n_hist:i] for y, i in zip(ys, idx)])[:, :, DYN]
+
+
 def sample(data: Dict, years: Sequence[int], K: int, rng: np.random.Generator, n: int):
     return gather(data, *pick(data, years, K, rng, n), K)
 
