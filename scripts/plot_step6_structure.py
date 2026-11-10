@@ -45,7 +45,7 @@ box(0, Y2, "purple", "Sequence + α ⊙ D(x)", ["x<sub>t</sub> − x<sub>t−12<
 box(1, Y2, "green", "SFNO residual R<sub>θ</sub>", ["in: x, 2 differences, F<sub>phys</sub>, time", "width 64, 4 layers, l<sub>max</sub> 16 (618 k)", "head zero init → starts as the core"])
 box(2, Y2, "blue", "6 h step", ["G = α D + t6 · R<sub>θ</sub>, sequence held fixed", "torchdiffeq midpoint", "then the sequence slides by 6 h"])
 box(3, Y2, "orange", "Loss on the rollout", ["L2 + H¹ Sobolev (λ 1)", "+ PINN hinge (λ 0.05, target 1)", "latitude weighted, per 6 h variance"])
-box(4, Y2, "gray", "Training", ["3000 it × batch 4, AdamW 3e-4", "K curriculum 1 → 2 → 4 → 8 steps", "past: ERA5, then own states · 2.9 h"])
+box(4, Y2, "gray", "Training", ["3000 it × batch 4, AdamW 3e-4", "K curriculum 1 → 2 → 4 → 8 steps", "past: ERA5, then own states · 4.1 h"])
 row_arrows(Y2, "purple")
 arrows.append(f"<path d='M {X[1]+BW/2} {Y2+BH} L {X[1]+BW/2} {Y3-10}' fill='none' stroke='{C['purple'][0]}' stroke-width='2' stroke-dasharray='7 6' marker-end='url(#a_purple)'/>")
 label(X[1] + BW/2 + 16, 856, "trained field", "purple", 15, 500)

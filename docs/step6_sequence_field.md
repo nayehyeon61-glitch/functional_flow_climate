@@ -66,4 +66,4 @@ python scripts/train_field.py --kai data/era5_5p625/kai6h --out runs/step6 --cac
 python scripts/predict.py --kai data/era5_5p625/kai6h --run runs/step6 --tag hybrid_speedy_full_seq --year 2017 --stride 20
 ```
 
-학습 시간은 CPU 4코어에서 2.9 h였다(1600 it에서 컨테이너가 재시작되어 체크포인트에서 이어 학습). 가중치와 점수는 공유 폴더 `step6/`에 있다.
+학습 시간은 CPU 4코어에서 약 4.1 h였다(1600 it에서 컨테이너가 재시작되어 체크포인트에서 이어 학습했고, 재시작 전 1.2 h와 후 2.9 h를 더한 값이다). 가중치와 점수는 공유 폴더 `step6/`에 있다.
